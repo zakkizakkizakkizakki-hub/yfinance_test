@@ -1,12 +1,14 @@
-name: market-yfinance-log
+name: market-yfinance
 
 on:
+  # GitHub Actions cron is UTC
+  # 例：毎時 05分に実行（好みで変えてOK）
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "5 * * * *"
   workflow_dispatch:
 
 concurrency:
-  group: market-yfinance-log
+  group: market-yfinance
   cancel-in-progress: true
 
 jobs:
@@ -21,7 +23,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -31,20 +33,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install "pandas==2.2.3" "yfinance==0.2.54"
 
-      - name: Run collector (no monitor)
-        run: |
-          set -euo pipefail
-          python market_collector.py
-
-      - name: Commit CSV
+      # ★重要：pull/rebase は「ファイル生成前」にやる（これで unstaged changes 問題を回避）
+      - name: Sync with remote
         run: |
           set -euo pipefail
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
+          git pull --rebase origin main
 
-          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
+      - name: Run collector
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          python market_yfinance_collector.py
 
-          git add market_yfinance_log.csv
+      - name: Run monitor (fail if missing/anomaly)
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          python monitor.py
+
+      - name: Commit and push CSVs
+        run: |
+          set -euo pipefail
+          git add -A
           git diff --cached --quiet && echo "No changes" && exit 0
-          git commit -m "Update market yfinance log"
-          git push
+          git commit -m "Update market yfinance logs"
+          git push origin main
