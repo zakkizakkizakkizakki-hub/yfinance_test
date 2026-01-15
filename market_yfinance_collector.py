@@ -3,18 +3,16 @@ from __future__ import annotations
 
 import os
 import time
-import csv
 import random
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Tuple
 
 import pandas as pd
 import yfinance as yf
 
-
-# =========================
-# Config
-# =========================
+# =====================
+# CONFIG
+# =====================
 JST = timezone(timedelta(hours=9))
 
 OUT_CSV = "market_yfinance_log.csv"
@@ -28,146 +26,99 @@ ASSETS = {
     "VIX": "^VIX",
 }
 
-YF_PERIOD = "7d"
-YF_INTERVAL = "1d"
-
-RETRIES = 3
-BASE_DELAY = 4  # seconds
-
 CSV_ENCODING = "utf-8-sig"
-CSV_QUOTING = csv.QUOTE_ALL
-CSV_LINETERMINATOR = "\n"
+MAX_RETRIES = 3
+BASE_DELAY_SEC = 3.0
 
 
-# =========================
-# Utils
-# =========================
 def now_jst_str() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _sleep_backoff(i: int) -> None:
-    # 1回目: 4-6秒 / 2回目: 8-12秒 / 3回目: 16-24秒
-    base = BASE_DELAY * (2 ** i)
+def sleep_jitter(base: float) -> None:
     time.sleep(base + random.uniform(0.5, 2.0))
 
 
-def _file_has_data(path: str) -> bool:
-    return os.path.exists(path) and os.path.getsize(path) > 0
-
-
-def _extract_last_close(df: pd.DataFrame, ticker: str) -> Tuple[Optional[float], str]:
+def fetch_one(ticker: str) -> Tuple[float, int, str, str]:
     """
-    yfinance download結果から ticker の終値を取り出す
-    成功: (price, date_str)
-    失敗: (None, "")
+    return: (value, missing_flag, date_str, fail_reason)
     """
-    if df is None or df.empty:
-        return None, ""
+    last_fail = ""
+    for _ in range(MAX_RETRIES):
+        try:
+            sleep_jitter(BASE_DELAY_SEC)
 
-    # 複数ティッカー指定時は columns が MultiIndex になる
-    # 例: df["Close"][ticker]
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            if ("Close", ticker) in df.columns:
-                s = df[("Close", ticker)]
-            elif "Close" in df.columns.get_level_values(0):
-                # Close層からtickerを探す
-                s = df["Close"][ticker]
+            df = yf.download(
+                ticker,
+                period="7d",
+                interval="1d",
+                progress=False,
+                threads=False,  # GitHub上で暴走しにくくする
+            )
+
+            if df is None or df.empty:
+                last_fail = "EmptyDF_or_NoClose"
+                continue
+
+            # Close列の取り出し（MultiIndex対策）
+            if "Close" in df.columns:
+                close = df["Close"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                close = pd.to_numeric(close, errors="coerce").dropna()
             else:
-                return None, ""
-        else:
-            # 単一ティッカー時
-            if "Close" not in df.columns:
-                return None, ""
-            s = df["Close"]
+                close = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
 
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if s.empty:
-            return None, ""
+            if close.empty:
+                last_fail = "EmptyDF_or_NoClose"
+                continue
 
-        price = float(s.iloc[-1])
-        date_str = str(s.index[-1])[:10]
-        if price <= 0:
-            return None, ""
+            val = float(close.iloc[-1])
+            if not (val > 0):
+                last_fail = "NonPositive"
+                continue
 
-        return price, date_str
-    except Exception:
-        return None, ""
+            date_str = str(close.index[-1])[:10]
+            return val, 0, date_str, ""
 
+        except Exception as e:
+            last_fail = type(e).__name__
+            continue
 
-# =========================
-# Core
-# =========================
-def fetch_all_once() -> pd.DataFrame:
-    tickers = " ".join(ASSETS.values())
-
-    # yfinanceは1銘柄ずつ叩くとレート制限を踏みやすいので、
-    # まとめて1回で取得する方針にする
-    df = yf.download(
-        tickers=tickers,
-        period=YF_PERIOD,
-        interval=YF_INTERVAL,
-        progress=False,
-        group_by="column",
-        threads=False,
-    )
-    return df
+    return 0.0, 1, "", last_fail
 
 
-def collect() -> None:
+def main() -> None:
     ts = now_jst_str()
+    row: Dict[str, object] = {"timestamp_jst": ts}
+
     print("=== yfinance market fetch ===")
     print(f"timestamp_jst: {ts}")
 
-    last_err = ""
-    df_all = None
-
-    for i in range(RETRIES):
-        try:
-            _sleep_backoff(i)
-            df_all = fetch_all_once()
-            if df_all is None or df_all.empty:
-                last_err = "EmptyDF"
-                continue
-            break
-        except Exception as e:
-            last_err = type(e).__name__
-            df_all = None
-            continue
-
-    row: Dict[str, object] = {"timestamp_jst": ts}
-
     for name, ticker in ASSETS.items():
-        price, date_str = _extract_last_close(df_all, ticker)
-        if price is None:
-            row[name] = 0.0
-            row[f"{name}_missing"] = 1
-            row[f"{name}_date"] = ""
-            row[f"{name}_fail"] = last_err or "EmptyDF_or_NoClose"
-            print(f"[yfinance] {name}({ticker}): 0.0 (missing) ❌ fail={row[f'{name}_fail']}")
-        else:
-            row[name] = float(price)
-            row[f"{name}_missing"] = 0
-            row[f"{name}_date"] = date_str
-            row[f"{name}_fail"] = ""
-            print(f"[yfinance] {name}({ticker}): {price} ({date_str}) ✅ fail=")
+        val, miss, date_str, fail = fetch_one(ticker)
 
-    out_df = pd.DataFrame([row])
-    header = not _file_has_data(OUT_CSV)
+        row[name] = val
+        row[f"{name}_missing"] = miss
+        row[f"{name}_date"] = date_str if date_str else None
+        row[f"{name}_fail"] = fail if fail else None
 
-    out_df.to_csv(
+        ok = "✅" if miss == 0 else "❌"
+        print(f"[yfinance] {name}({ticker}): {val} ({date_str}) {ok} fail={fail}")
+
+    df = pd.DataFrame([row])
+
+    header = not (os.path.exists(OUT_CSV) and os.path.getsize(OUT_CSV) > 0)
+    df.to_csv(
         OUT_CSV,
         mode="a",
         index=False,
         header=header,
         encoding=CSV_ENCODING,
-        quoting=CSV_QUOTING,
-        lineterminator=CSV_LINETERMINATOR,
     )
 
     print(f"=== saved -> {OUT_CSV} ===")
 
 
 if __name__ == "__main__":
-    collect()
+    main()
