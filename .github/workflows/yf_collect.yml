@@ -1,16 +1,16 @@
-name: yfinance-collect
+name: market_yfinance
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"   # 毎時00分（UTC）※必要なら後で調整
+    - cron: "0 * * * *"   # 1時間おき（UTC）
+  workflow_dispatch:
 
 concurrency:
-  group: yfinance-collect
+  group: market-yfinance
   cancel-in-progress: true
 
 jobs:
-  collect:
+  run:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -21,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -29,30 +29,20 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # ★重要：pull を先にやる（後で「unstaged changes」でrebase失敗しにくくなる）
-      - name: Git pull (rebase)
-        run: |
-          set -euo pipefail
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git pull --rebase origin main || true
+          pip install "pandas==2.2.3" "yfinance==0.2.54"
 
       - name: Run collector
         run: |
           set -euo pipefail
-          python yf_collect_to_csv.py
+          python market_yfinance_collector.py
 
-      - name: Commit & push CSV
+      - name: Commit & Push
         run: |
           set -euo pipefail
-
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git pull --rebase origin main || { git rebase --abort || true; exit 1; }
           git add -A
-          if git diff --cached --quiet; then
-            echo "No changes"
-            exit 0
-          fi
-
+          git diff --cached --quiet && echo "No changes" && exit 0
           git commit -m "Update market_yfinance_log.csv"
           git push origin main
