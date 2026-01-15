@@ -1,0 +1,58 @@
+name: yfinance-collect
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"   # 毎時00分（UTC）※必要なら後で調整
+
+concurrency:
+  group: yfinance-collect
+  cancel-in-progress: true
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ★重要：pull を先にやる（後で「unstaged changes」でrebase失敗しにくくなる）
+      - name: Git pull (rebase)
+        run: |
+          set -euo pipefail
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git pull --rebase origin main || true
+
+      - name: Run collector
+        run: |
+          set -euo pipefail
+          python yf_collect_to_csv.py
+
+      - name: Commit & push CSV
+        run: |
+          set -euo pipefail
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+
+          git commit -m "Update market_yfinance_log.csv"
+          git push origin main
