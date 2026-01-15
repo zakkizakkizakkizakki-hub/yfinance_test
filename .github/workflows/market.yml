@@ -1,18 +1,17 @@
-name: market-yfinance
+name: market-yfinance-log
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"  # 毎時0分（UTC）
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 concurrency:
-  group: market-yfinance
+  group: market-yfinance-log
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     permissions:
       contents: write
 
@@ -22,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -32,36 +31,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install "pandas==2.2.3" "yfinance==0.2.54"
 
-      # 重要：先に pull して作業ツリーを「最新＆クリーン」にする（後で rebase 失敗しにくい）
-      - name: Pull latest (rebase)
+      - name: Run collector (no monitor)
+        run: |
+          set -euo pipefail
+          python market_collector.py
+
+      - name: Commit CSV
         run: |
           set -euo pipefail
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git pull --rebase origin main || true
 
-      - name: Run collector (append CSV)
-        env:
-          PYTHONUTF8: "1"
-          OUT_CSV: "market_yfinance_log.csv"
-        run: |
-          set -euo pipefail
-          python market_yfinance_collector.py
+          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
 
-      - name: Commit & push CSV
-        run: |
-          set -euo pipefail
-          git add -A
-
-          # 変更が無ければ終了
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-
-          git commit -m "Update market_yfinance_log.csv"
-
-          # push が弾かれることがあるので軽くリトライ
-          for i in 1 2 3; do
-            git push origin main && break
-            echo "push failed. retry $i/3..."
-            sleep 3
-            git pull --rebase origin main || true
-          done
+          git add market_yfinance_log.csv
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update market yfinance log"
+          git push
