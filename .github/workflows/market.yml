@@ -1,9 +1,10 @@
 name: yfinance-market
 
 on:
-  schedule:
-    - cron: "0 * * * *"   # 毎時（必要に応じて変更）
   workflow_dispatch:
+  schedule:
+    # 切り分け中は頻度を落としてレート制限の影響を見やすくする（必要なら後で上げる）
+    - cron: "17 */3 * * *"   # 3時間ごと
 
 concurrency:
   group: yfinance-market
@@ -12,14 +13,12 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -27,29 +26,27 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install "pandas==2.2.3" "yfinance==0.2.54"
+          pip install yfinance pandas
 
-      - name: Run collector
+      - name: Collector
+        env:
+          MARKET_CSV: market_yfinance_log.csv
+          YF_MAX_RETRIES: "4"
+          YF_BASE_SLEEP_SEC: "15"
+          YF_TIMEOUT_SEC: "20"
         run: |
-          set -euo pipefail
           python market_yfinance_collector.py
 
-      - name: Run monitor (fail if missing/abnormal)
+      - name: Monitor (fail on missing)
+        env:
+          MARKET_CSV: market_yfinance_log.csv
         run: |
-          set -euo pipefail
           python monitor.py
 
-      - name: Commit CSV
-        run: |
-          set -euo pipefail
-          git config user.name "GitHub Action"
-          git config user.email "action@github.com"
-
-          # 初回でも落ちないように
-          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
-
-          git add -A
-          git diff --cached --quiet && echo "No changes" && exit 0
-
-          git commit -m "Update market_yfinance_log.csv"
-          git push
+      # 失敗しても必ずCSVを回収して原因追及を止めない
+      - name: Upload CSV artifact (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: market_yfinance_log
+          path: market_yfinance_log.csv
