@@ -1,180 +1,196 @@
-# save as: market_yfinance_collector.py
+# market_yfinance_collector.py
 from __future__ import annotations
 
 import os
-import csv
 import time
 import random
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, Optional
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-import yfinance as yf
 
+try:
+    import yfinance as yf
+except Exception as e:
+    raise SystemExit(f"yfinance import failed: {e}")
 
-JST = timezone(timedelta(hours=9))
+JST = ZoneInfo("Asia/Tokyo")
 
-# 既存CSV仕様（壊さない）
-OUT_CSV = "market_yfinance_log.csv"
-CSV_ENCODING = "utf-8-sig"
-CSV_QUOTING = csv.QUOTE_ALL
-CSV_LINETERMINATOR = "\n"  # ← pandas引数は lineterminator
+# 収集対象（あなたのログに合わせた）
+ASSETS = [
+    ("USDJPY", "JPY=X"),
+    ("BTC", "BTC-USD"),
+    ("Gold", "GC=F"),
+    ("US10Y", "^TNX"),
+    ("Oil", "CL=F"),
+    ("VIX", "^VIX"),
+]
 
-ASSETS: Dict[str, str] = {
-    "USDJPY": "JPY=X",
-    "BTC": "BTC-USD",
-    "Gold": "GC=F",
-    "US10Y": "^TNX",
-    "Oil": "CL=F",
-    "VIX": "^VIX",
-}
+OUT_CSV = os.getenv("MARKET_CSV", "market_yfinance_log.csv")
 
-# yfinance settings
-YF_PERIOD = "7d"
-YF_INTERVAL = "1d"
-YF_RETRIES = 4
-BASE_DELAY_SEC = 4
+# リトライ設定（“間隔を確認したい”とのことなので明示＆ログ出し）
+MAX_RETRIES = int(os.getenv("YF_MAX_RETRIES", "4"))
+BASE_SLEEP_SEC = float(os.getenv("YF_BASE_SLEEP_SEC", "15"))  # 15秒を基準に指数バックオフ
+TIMEOUT_SEC = int(os.getenv("YF_TIMEOUT_SEC", "20"))
 
 
 def now_jst_str() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _sleep_backoff(i: int) -> None:
-    # exponential-ish backoff with jitter
-    base = BASE_DELAY_SEC * (1.6 ** i)
-    time.sleep(base + random.uniform(0.5, 2.0))
-
-
-def _file_has_data(path: str) -> bool:
-    return os.path.exists(path) and os.path.getsize(path) > 0
-
-
-def _extract_last_close(df: pd.DataFrame, ticker: str) -> Tuple[Optional[float], str, str]:
-    """
-    Returns: (price, date_str, fail_reason)
-    - price: last Close (float) or None
-    - date_str: YYYY-MM-DD or ""
-    - fail_reason: "" if ok else reason
-    """
-    if df is None or df.empty:
-        return None, "", "EmptyDF"
-
-    # yf.download with multiple tickers often yields MultiIndex columns:
-    # columns like ('Close','BTC-USD') or ('BTC-USD','Close') depending on options.
+def _safe_float(x) -> float:
     try:
-        # Case A: MultiIndex columns
-        if isinstance(df.columns, pd.MultiIndex):
-            # Try common shapes
-            # 1) ('Close', 'TICKER')
-            if ("Close", ticker) in df.columns:
-                s = df[("Close", ticker)]
-            # 2) ('TICKER', 'Close')
-            elif (ticker, "Close") in df.columns:
-                s = df[(ticker, "Close")]
-            else:
-                # last resort: search any column that contains Close for this ticker
-                candidates = [c for c in df.columns if "Close" in c and ticker in c]
-                if not candidates:
-                    return None, "", "NoCloseColumn"
-                s = df[candidates[0]]
-        else:
-            # Case B: single ticker: normal columns
-            if "Close" not in df.columns:
-                return None, "", "NoCloseColumn"
-            s = df["Close"]
+        if x is None:
+            return 0.0
+        if isinstance(x, str) and x.strip() == "":
+            return 0.0
+        v = float(x)
+        if pd.isna(v):
+            return 0.0
+        return v
+    except Exception:
+        return 0.0
 
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if s.empty:
-            return None, "", "NoDataAfterDrop"
 
-        price = float(s.iloc[-1])
-        if not (price > 0):
-            return None, "", "NonPositive"
+def fetch_once() -> tuple[dict[str, dict], str]:
+    """
+    6銘柄を1回の yf.download で取得（呼び出し回数を最小化）。
+    戻り値:
+      - result: {asset: {price, date, src, fail}}
+      - warn: 失敗要因の簡易文字列（例: EmptyDF / NoClose / Exception:...）
+    """
+    tickers = " ".join([t for _, t in ASSETS])
 
-        idx = s.index[-1]
-        date_str = str(idx)[:10]
-        return price, date_str, ""
+    try:
+        df = yf.download(
+            tickers=tickers,
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=True,   # ログにも出ている “default changed” の影響を固定
+            threads=False,      # スレッドで同時に叩くのを避ける（レート制限悪化を防ぐ）
+            progress=False,
+            timeout=TIMEOUT_SEC,
+        )
     except Exception as e:
-        return None, "", f"ParseErr:{type(e).__name__}"
+        res = {}
+        for asset, _ in ASSETS:
+            res[asset] = {"price": 0.0, "date": "", "src": "missing", "fail": f"Exception:{type(e).__name__}"}
+        return res, f"Exception:{type(e).__name__}"
 
+    if df is None or len(df) == 0:
+        res = {}
+        for asset, _ in ASSETS:
+            res[asset] = {"price": 0.0, "date": "", "src": "missing", "fail": "EmptyDF"}
+        return res, "EmptyDF"
 
-def _download_batch(tickers: list[str]) -> Tuple[pd.DataFrame, str]:
-    """
-    Returns (df, fail_reason). fail_reason empty if success-ish (even if some tickers empty).
-    """
-    last_err = ""
-    for i in range(YF_RETRIES):
+    # yfinanceの返り値は MultiIndex の場合がある
+    # 例: columns = ('Close','JPY=X') もしくは ticker->OHLCV の入れ子
+    # ここでは「各銘柄の最後の Close」を取りに行く
+    result = {}
+    for asset, ticker in ASSETS:
+        price = 0.0
+        date_str = ""
+        fail = ""
+
         try:
-            if i > 0:
-                _sleep_backoff(i - 1)
+            close_series = None
 
-            df = yf.download(
-                tickers=tickers,
-                period=YF_PERIOD,
-                interval=YF_INTERVAL,
-                group_by="column",
-                threads=False,      # ← GitHub Actionsで暴れやすいのを抑える
-                progress=False,
-                auto_adjust=False,  # ← 警告抑制・挙動固定
-            )
-            return df, ""
+            # パターンA: columns が (field, ticker) の MultiIndex
+            if isinstance(df.columns, pd.MultiIndex):
+                if ("Close", ticker) in df.columns:
+                    close_series = df[("Close", ticker)]
+                elif ("Adj Close", ticker) in df.columns:
+                    close_series = df[("Adj Close", ticker)]
+
+            # パターンB: columns が ticker->field 形式（group_by="ticker" で起きがち）
+            if close_series is None:
+                if ticker in df.columns:
+                    sub = df[ticker]
+                    if isinstance(sub, pd.DataFrame) and "Close" in sub.columns:
+                        close_series = sub["Close"]
+
+            if close_series is None:
+                fail = "NoClose"
+            else:
+                close_series = close_series.dropna()
+                if len(close_series) == 0:
+                    fail = "NoClose"
+                else:
+                    last_dt = close_series.index[-1]
+                    # pandas Timestamp の場合あり
+                    if hasattr(last_dt, "to_pydatetime"):
+                        last_dt = last_dt.to_pydatetime()
+                    date_str = str(last_dt.date())
+                    price = float(close_series.iloc[-1])
+
         except Exception as e:
-            last_err = type(e).__name__
-            continue
+            fail = f"ParseErr:{type(e).__name__}"
 
-    return pd.DataFrame(), last_err or "DownloadFailed"
+        if fail:
+            result[asset] = {"price": 0.0, "date": "", "src": "missing", "fail": fail}
+        else:
+            result[asset] = {"price": price, "date": date_str, "src": "yfinance", "fail": ""}
+
+    # 6個すべて missing なら “実質失敗”
+    if all(result[a]["src"] == "missing" for a, _ in ASSETS):
+        return result, "AllMissing"
+
+    return result, ""
 
 
-def collect() -> None:
+def collect() -> int:
     print("=== yfinance market fetch ===")
-    print(f"timestamp_jst: {now_jst_str()}")
+    ts_jst = now_jst_str()
+    print(f"timestamp_jst: {ts_jst}")
 
-    # 1) batch download（リクエスト回数を最小化）
-    tickers = list(ASSETS.values())
-    df_all, batch_err = _download_batch(tickers)
+    last_warn = ""
+    final = None
 
-    # 2) 既存CSV仕様を維持しつつ、追加で理由列も出す（後方互換）
-    row: Dict[str, object] = {"timestamp_jst": now_jst_str()}
+    for attempt in range(1, MAX_RETRIES + 1):
+        data, warn = fetch_once()
+        final = data
+        last_warn = warn
 
-    # 追加のログ列（壊さない：末尾に増えるだけ）
-    row["yf_batch_fail"] = batch_err
+        # 成功判定：少なくとも1つは取れている
+        ok_any = any(v["src"] != "missing" for v in data.values())
+        if ok_any:
+            break
 
-    for name, ticker in ASSETS.items():
-        price, date_str, fail = _extract_last_close(df_all, ticker)
+        # 失敗時の待ち（指数バックオフ＋ジッター）
+        sleep_sec = BASE_SLEEP_SEC * (2 ** (attempt - 1))
+        sleep_sec = sleep_sec * (0.8 + 0.4 * random.random())  # 0.8〜1.2倍
+        sleep_sec = min(sleep_sec, 180)  # 上限3分
+        print(f"[retry] attempt={attempt}/{MAX_RETRIES} warn={warn} sleep={sleep_sec:.1f}s")
+        time.sleep(sleep_sec)
 
-        missing = 0
-        if price is None:
-            missing = 1
-            price = 0.0
+    # CSV行を作る（既存仕様を維持しつつ、理由ログ列を追加）
+    row = {
+        "timestamp_jst": ts_jst,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "run_warn": last_warn,
+    }
+    for asset, _ in ASSETS:
+        row[f"{asset}_price"] = _safe_float(final[asset]["price"])
+        row[f"{asset}_date"] = final[asset]["date"]
+        row[f"{asset}_src"] = final[asset]["src"]
+        row[f"{asset}_fail"] = final[asset]["fail"]
 
-        # 既存列（維持）
-        row[name] = float(price)
-        row[f"{name}_date"] = date_str
-        row[f"{name}_missing"] = int(missing)
-
-        # 追加列（理由ログ）
-        # 既存仕様は壊さず、monitor側が見たいときだけ見る
-        row[f"{name}_fail"] = fail if fail else (batch_err if batch_err else "")
-
-        status = "✅" if missing == 0 else "❌"
-        print(f"[yfinance] {name}({ticker}): {row[name]} ({date_str}) {status} fail={row[f'{name}_fail']}")
+        # 表示ログ（あなたの形式に寄せる）
+        status = "✅" if final[asset]["src"] != "missing" else "❌"
+        print(f"[{final[asset]['src']}] {asset}: {row[f'{asset}_price']} ({row[f'{asset}_date']}) {status} fail={final[asset]['fail']}")
 
     out_df = pd.DataFrame([row])
 
-    header = not _file_has_data(OUT_CSV)
-    out_df.to_csv(
-        OUT_CSV,
-        mode="a",
-        index=False,
-        header=header,
-        encoding=CSV_ENCODING,
-        quoting=CSV_QUOTING,
-        lineterminator=CSV_LINETERMINATOR,  # ← 正しい引数名
-    )
+    # 追記保存（ヘッダは初回だけ）
+    exists = os.path.exists(OUT_CSV)
+    out_df.to_csv(OUT_CSV, mode="a", index=False, header=not exists)
 
     print(f"=== saved -> {OUT_CSV} ===")
 
+    # collector自体は「欠損で落とす」責務を持たせない（監視は monitor が担当）
+    return 0
+
 
 if __name__ == "__main__":
-    collect()
+    raise SystemExit(collect())
