@@ -1,112 +1,94 @@
-# save as: monitor.py
+# monitor.py
 from __future__ import annotations
 
 import os
-import math
 import pandas as pd
-from typing import Dict, List, Tuple
+from datetime import datetime
 
-CSV_PATH = "market_yfinance_log.csv"
+
+CSV_PATH = os.getenv("MARKET_CSV", "market_yfinance_log.csv")
 
 ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
-# 異常値検知（ざっくり安全側：必要なら後で調整）
-MAX_ABS_PCT_CHANGE: Dict[str, float] = {
-    "USDJPY": 0.05,  # 5%
-    "US10Y":  0.20,  # 20%
-    "Gold":  0.15,
-    "Oil":   0.25,
-    "VIX":   1.00,   # VIXは跳ねる
-    "BTC":   0.40,   # BTCは跳ねる
+# 簡易な異常値検知（“明らかにおかしい” を落とす）
+# ※厳密な金融工学的レンジではなく「ゼロ/負/NaN」や極端値を検知する最小限
+ABNORMAL_RULES = {
+    "USDJPY": (50, 300),
+    "BTC": (1000, 1_000_000),
+    "Gold": (100, 50_000),
+    "US10Y": (0.0, 20.0),
+    "Oil": (1, 500),
+    "VIX": (1, 200),
 }
 
-def _to_float(x) -> float:
-    try:
-        v = float(x)
-        if not math.isfinite(v):
-            return float("nan")
-        return v
-    except Exception:
-        return float("nan")
-
-def _latest_non_missing(df: pd.DataFrame, asset: str) -> Tuple[float, str]:
-    """
-    Returns (value, timestamp_jst) for the latest row where asset_missing == 0 and value > 0
-    If not found, returns (nan, "")
-    """
-    miss_col = f"{asset}_missing"
-    if miss_col not in df.columns or asset not in df.columns:
-        return float("nan"), ""
-    d = df.copy()
-    d[asset] = pd.to_numeric(d[asset], errors="coerce")
-    d[miss_col] = pd.to_numeric(d[miss_col], errors="coerce").fillna(1).astype(int)
-    d = d[(d[miss_col] == 0) & (d[asset].notna()) & (d[asset] > 0)]
-    if d.empty:
-        return float("nan"), ""
-    r = d.iloc[-1]
-    return float(r[asset]), str(r.get("timestamp_jst", ""))
 
 def main() -> int:
+    if not os.path.exists(CSV_PATH):
+        print(f"[ERROR] CSV not found: {CSV_PATH}")
+        return 1
+
+    df = pd.read_csv(CSV_PATH)
+    if df.empty:
+        print("[ERROR] CSV is empty")
+        return 1
+
+    last = df.iloc[-1].to_dict()
+    latest_ts = str(last.get("timestamp_jst", "Unknown"))
+
     print("\n" + "=" * 60)
     print("📡 Market Monitor")
     print("=" * 60)
+    print(f"[ Latest ] {latest_ts}")
 
-    if not os.path.exists(CSV_PATH):
-        print(f"❌ CSVが見つかりません: {CSV_PATH}")
-        return 1
-
-    df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
-    if df.empty:
-        print("❌ CSVが空です")
-        return 1
-
-    last = df.iloc[-1]
-    ts = str(last.get("timestamp_jst", "Unknown"))
-    print(f"[ Latest ] {ts}")
-
-    missing_assets: List[str] = []
-    abnormal_assets: List[str] = []
+    missing = []
+    abnormal = []
 
     for a in ASSETS:
-        v = _to_float(last.get(a))
-        miss = int(_to_float(last.get(f"{a}_missing")) or 0)
-        date = str(last.get(f"{a}_date", ""))
-        fail = str(last.get(f"{a}_fail", ""))
+        price_key = f"{a}_price"
+        src_key = f"{a}_src"
+        fail_key = f"{a}_fail"
+        date_key = f"{a}_date"
 
-        is_missing = (miss == 1) or (not math.isfinite(v)) or (v <= 0)
-        status = "✅正常" if not is_missing else "⚠️欠損"
+        src = str(last.get(src_key, "missing"))
+        fail = str(last.get(fail_key, ""))
+        date = str(last.get(date_key, ""))
 
-        print(f" - {a:5s}: {v:12.6f} ({status}) date={date if date else 'nan'}")
-        if fail:
+        # 数値化できないケースは欠損扱いに倒す（monitorが落ちるべき）
+        try:
+            v = float(last.get(price_key))
+        except Exception:
+            v = float("nan")
+
+        is_missing = (src == "missing") or (pd.isna(v)) or (v == 0.0)
+        if is_missing:
+            missing.append(a)
+
+        # 異常値（ただし欠損は別枠で扱う）
+        if not is_missing:
+            lo, hi = ABNORMAL_RULES[a]
+            if not (lo <= v <= hi):
+                abnormal.append(a)
+
+        status = "⚠️欠損" if is_missing else "✅正常"
+        print(f" - {a:5s}: {v:12.6f} ({status}) date={date or 'nan'}")
+        if fail and fail != "nan":
             print(f"   Warning: {a}_fail: {fail}")
 
-        if is_missing:
-            missing_assets.append(a)
-            continue
-
-        # 異常値検知：前回の「正常値」と比較
-        prev_v, prev_ts = _latest_non_missing(df.iloc[:-1], a) if len(df) >= 2 else (float("nan"), "")
-        if math.isfinite(prev_v) and prev_v > 0:
-            pct = abs(v / prev_v - 1.0)
-            if pct > MAX_ABS_PCT_CHANGE.get(a, 0.50):
-                abnormal_assets.append(a)
-                print(f"   ❗ Abnormal: prev={prev_v:.6f} at {prev_ts}  change={pct*100:.1f}%")
-
-    if missing_assets:
+    if abnormal:
         print("\n" + "!" * 60)
-        print(f"❌ 欠損を検知: {', '.join(missing_assets)}")
+        print(f"❌ 異常値を検知: {', '.join(abnormal)}")
         print("   → 監視仕様により exit code 1 で終了します。")
         print("!" * 60)
         return 1
 
-    if abnormal_assets:
+    if missing:
         print("\n" + "!" * 60)
-        print(f"❌ 異常値を検知: {', '.join(abnormal_assets)}")
+        print(f"❌ 欠損を検知: {', '.join(missing)}")
         print("   → 監視仕様により exit code 1 で終了します。")
         print("!" * 60)
         return 1
 
-    print("\n✅ OK: 欠損なし / 異常値なし")
+    print("\n✅ All OK")
     return 0
 
 
