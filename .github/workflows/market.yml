@@ -1,0 +1,108 @@
+name: market
+
+on:
+  schedule:
+    # まずは「1日数回」など控えめ推奨（レート制限の切り分けが終わるまで）
+    - cron: "0 * * * *"   # 毎時ちょうど（UTC）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "market=collect+monitor / probe=only HTTP probe"
+        required: true
+        default: "market"
+        type: choice
+        options:
+          - market
+          - probe
+
+concurrency:
+  group: market-run
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ✅ 先にpull（後でファイル生成してからpullすると衝突しやすい）
+      - name: Sync with origin/main (safe)
+        run: |
+          set -euo pipefail
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git pull --rebase origin main || { echo "git pull --rebase failed"; git rebase --abort || true; exit 1; }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # requirements.txt がある前提（なければここを pip install ... に置換）
+          pip install -r requirements.txt
+
+      - name: Run (capture logs)
+        env:
+          MODE: ${{ inputs.mode || 'market' }}
+        run: |
+          set -euo pipefail
+          mkdir -p run_logs
+
+          {
+            echo "=== Run at $(date -u) UTC ==="
+            python --version
+            pip --version
+            echo "--- pip freeze ---"
+            pip freeze
+            echo "------------------"
+            echo "MODE=${MODE}"
+            echo "------------------"
+
+            if [ "${MODE}" = "probe" ]; then
+              echo "--- probe (HTTP evidence) ---"
+              python yahoo_http_probe.py
+              echo "=== End (probe) ==="
+              exit 0
+            fi
+
+            echo "--- collector ---"
+            python market_yfinance_collector.py
+
+            echo "--- monitor ---"
+            python monitor.py
+
+            echo "=== End (market) ==="
+          } 2>&1 | tee -a run_logs/run.log
+
+      - name: Upload run logs (artifact)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs
+          path: run_logs/run.log
+          retention-days: 14
+
+      # ✅ marketモードのときだけコミット
+      - name: Commit & Push (market only)
+        if: ${{ (inputs.mode || 'market') == 'market' }}
+        run: |
+          set -euo pipefail
+
+          # 収集CSVの置き場所に合わせて調整（data/運用なら data/ を残す）
+          # ここは「全部」拾う方が事故が少ない
+          git add -A
+
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+
+          git commit -m "Update market log"
+          git push origin main
