@@ -1,52 +1,75 @@
-name: yfinance-market
+name: market
 
 on:
-  workflow_dispatch:
   schedule:
-    # 切り分け中は頻度を落としてレート制限の影響を見やすくする（必要なら後で上げる）
-    - cron: "17 */3 * * *"   # 3時間ごと
+    - cron: '0 * * * *'  # 例: 毎時（UTC）。切り分け中は間隔を広げるのが安全
+  workflow_dispatch:
 
 concurrency:
-  group: yfinance-market
+  group: market
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas
+          pip install "pandas==2.2.3" "yfinance==0.2.54"
 
-      - name: Collector
-        env:
-          MARKET_CSV: market_yfinance_log.csv
-          YF_MAX_RETRIES: "4"
-          YF_BASE_SLEEP_SEC: "15"
-          YF_TIMEOUT_SEC: "20"
+      - name: Run collector + monitor (capture logs)
         run: |
-          python market_yfinance_collector.py
+          set -euo pipefail
+          mkdir -p run_logs
 
-      - name: Monitor (fail on missing)
-        env:
-          MARKET_CSV: market_yfinance_log.csv
-        run: |
-          python monitor.py
+          {
+            echo "=== Run at $(date -u) UTC ==="
+            python --version
+            pip --version
+            echo "--- collector ---"
+            python market_yfinance_collector.py
+            echo "--- monitor ---"
+            python monitor.py
+            echo "=== End ==="
+          } 2>&1 | tee -a run_logs/run.log
 
-      # 失敗しても必ずCSVを回収して原因追及を止めない
-      - name: Upload CSV artifact (always)
+      - name: Upload logs (artifact)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: market_yfinance_log
-          path: market_yfinance_log.csv
+          name: run-logs
+          path: run_logs/run.log
+          retention-days: 14
+
+      - name: Commit CSV & logs
+        run: |
+          set -euo pipefail
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          # 競合回避のため pull
+          git pull --rebase origin main || { echo "git pull --rebase failed"; git rebase --abort || true; exit 1; }
+
+          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
+          git add -A
+
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update market log"
+          git push origin main
