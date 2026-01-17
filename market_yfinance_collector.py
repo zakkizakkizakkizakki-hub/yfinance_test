@@ -1,196 +1,180 @@
-# market_yfinance_collector.py
+# save as: market_yfinance_collector.py
 from __future__ import annotations
 
 import os
 import time
 import random
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Tuple, Optional
 
 import pandas as pd
+import yfinance as yf
 
-try:
-    import yfinance as yf
-except Exception as e:
-    raise SystemExit(f"yfinance import failed: {e}")
+# =========================
+# Config
+# =========================
+JST = timezone(timedelta(hours=9))
 
-JST = ZoneInfo("Asia/Tokyo")
+OUT_CSV = "market_yfinance_log.csv"
+ENCODING = "utf-8-sig"
+CSV_QUOTING = 1  # csv.QUOTE_ALL 相当（pandas側で数値指定）
+LINE_TERMINATOR = "\n"  # pandasは lineterminator
 
-# 収集対象（あなたのログに合わせた）
-ASSETS = [
-    ("USDJPY", "JPY=X"),
-    ("BTC", "BTC-USD"),
-    ("Gold", "GC=F"),
-    ("US10Y", "^TNX"),
-    ("Oil", "CL=F"),
-    ("VIX", "^VIX"),
-]
+ASSETS = {
+    "USDJPY": "JPY=X",
+    "BTC": "BTC-USD",
+    "Gold": "GC=F",
+    "US10Y": "^TNX",
+    "Oil": "CL=F",
+    "VIX": "^VIX",
+}
 
-OUT_CSV = os.getenv("MARKET_CSV", "market_yfinance_log.csv")
+# yfinance取得設定
+YF_PERIOD = "7d"
+YF_INTERVAL = "1d"
 
-# リトライ設定（“間隔を確認したい”とのことなので明示＆ログ出し）
-MAX_RETRIES = int(os.getenv("YF_MAX_RETRIES", "4"))
-BASE_SLEEP_SEC = float(os.getenv("YF_BASE_SLEEP_SEC", "15"))  # 15秒を基準に指数バックオフ
-TIMEOUT_SEC = int(os.getenv("YF_TIMEOUT_SEC", "20"))
+# Retry / backoff
+MAX_TRIES = 4
+BASE_SLEEP = 5.0         # seconds
+BACKOFF_MULT = 3.0       # 5s -> 15s -> 45s -> 135s
+JITTER_MIN = 0.5
+JITTER_MAX = 3.0
+
+# “異常値検知”のための最低限ルール（値が0以下なら欠損扱い）
+# ここは監視を強めたいなら後で拡張できます
+def _is_valid_price(x: Optional[float]) -> bool:
+    try:
+        if x is None:
+            return False
+        v = float(x)
+        return v > 0.0
+    except Exception:
+        return False
 
 
 def now_jst_str() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _safe_float(x) -> float:
+def _sleep_with_backoff(attempt: int) -> None:
+    # attempt: 1..MAX_TRIES-1 (次の試行前)
+    base = BASE_SLEEP * (BACKOFF_MULT ** (attempt - 1))
+    time.sleep(base + random.uniform(JITTER_MIN, JITTER_MAX))
+
+
+def _pick_last_close(df: pd.DataFrame) -> Tuple[Optional[float], str]:
+    """
+    yfinance download の DataFrame から最後の Close を拾う。
+    返り値: (price, date_str)
+    """
+    if df is None or df.empty:
+        return None, ""
+
+    if "Close" in df.columns:
+        s = df["Close"]
+        if isinstance(s, pd.DataFrame):
+            # まれに複数列になるケース
+            s = s.iloc[:, 0]
+    else:
+        # 念のため
+        s = df.iloc[:, 0]
+
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if s.empty:
+        return None, ""
+
+    price = float(s.iloc[-1])
+    idx = s.index[-1]
+    # indexがTimestampなら日付を取る
     try:
-        if x is None:
-            return 0.0
-        if isinstance(x, str) and x.strip() == "":
-            return 0.0
-        v = float(x)
-        if pd.isna(v):
-            return 0.0
-        return v
+        date_str = str(pd.to_datetime(idx).date())
     except Exception:
-        return 0.0
-
-
-def fetch_once() -> tuple[dict[str, dict], str]:
-    """
-    6銘柄を1回の yf.download で取得（呼び出し回数を最小化）。
-    戻り値:
-      - result: {asset: {price, date, src, fail}}
-      - warn: 失敗要因の簡易文字列（例: EmptyDF / NoClose / Exception:...）
-    """
-    tickers = " ".join([t for _, t in ASSETS])
-
-    try:
-        df = yf.download(
-            tickers=tickers,
-            period="5d",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=True,   # ログにも出ている “default changed” の影響を固定
-            threads=False,      # スレッドで同時に叩くのを避ける（レート制限悪化を防ぐ）
-            progress=False,
-            timeout=TIMEOUT_SEC,
-        )
-    except Exception as e:
-        res = {}
-        for asset, _ in ASSETS:
-            res[asset] = {"price": 0.0, "date": "", "src": "missing", "fail": f"Exception:{type(e).__name__}"}
-        return res, f"Exception:{type(e).__name__}"
-
-    if df is None or len(df) == 0:
-        res = {}
-        for asset, _ in ASSETS:
-            res[asset] = {"price": 0.0, "date": "", "src": "missing", "fail": "EmptyDF"}
-        return res, "EmptyDF"
-
-    # yfinanceの返り値は MultiIndex の場合がある
-    # 例: columns = ('Close','JPY=X') もしくは ticker->OHLCV の入れ子
-    # ここでは「各銘柄の最後の Close」を取りに行く
-    result = {}
-    for asset, ticker in ASSETS:
-        price = 0.0
         date_str = ""
-        fail = ""
+    return price, date_str
 
+
+def fetch_one_ticker(ticker: str) -> Tuple[float, int, str, str]:
+    """
+    返り値: (price, missing_flag, date_str, fail_reason)
+    """
+    last_err = ""
+    for i in range(1, MAX_TRIES + 1):
         try:
-            close_series = None
+            df = yf.download(
+                ticker,
+                period=YF_PERIOD,
+                interval=YF_INTERVAL,
+                progress=False,
+                threads=False,  # 余計な並列を避ける（レート制限悪化を避けたい）
+            )
+            price, date_str = _pick_last_close(df)
 
-            # パターンA: columns が (field, ticker) の MultiIndex
-            if isinstance(df.columns, pd.MultiIndex):
-                if ("Close", ticker) in df.columns:
-                    close_series = df[("Close", ticker)]
-                elif ("Adj Close", ticker) in df.columns:
-                    close_series = df[("Adj Close", ticker)]
+            if _is_valid_price(price):
+                # OK
+                return float(price), 0, date_str, ""
 
-            # パターンB: columns が ticker->field 形式（group_by="ticker" で起きがち）
-            if close_series is None:
-                if ticker in df.columns:
-                    sub = df[ticker]
-                    if isinstance(sub, pd.DataFrame) and "Close" in sub.columns:
-                        close_series = sub["Close"]
-
-            if close_series is None:
-                fail = "NoClose"
-            else:
-                close_series = close_series.dropna()
-                if len(close_series) == 0:
-                    fail = "NoClose"
-                else:
-                    last_dt = close_series.index[-1]
-                    # pandas Timestamp の場合あり
-                    if hasattr(last_dt, "to_pydatetime"):
-                        last_dt = last_dt.to_pydatetime()
-                    date_str = str(last_dt.date())
-                    price = float(close_series.iloc[-1])
-
+            last_err = "EmptyDF_or_NoClose"
         except Exception as e:
-            fail = f"ParseErr:{type(e).__name__}"
+            last_err = type(e).__name__
 
-        if fail:
-            result[asset] = {"price": 0.0, "date": "", "src": "missing", "fail": fail}
-        else:
-            result[asset] = {"price": price, "date": date_str, "src": "yfinance", "fail": ""}
+        if i < MAX_TRIES:
+            _sleep_with_backoff(i)
 
-    # 6個すべて missing なら “実質失敗”
-    if all(result[a]["src"] == "missing" for a, _ in ASSETS):
-        return result, "AllMissing"
-
-    return result, ""
+    # 全滅
+    return 0.0, 1, "", last_err or "UnknownFail"
 
 
-def collect() -> int:
-    print("=== yfinance market fetch ===")
-    ts_jst = now_jst_str()
-    print(f"timestamp_jst: {ts_jst}")
+def _ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    CSV仕様（25列）を固定化。
+    """
+    cols = ["timestamp_jst"]
+    for a in ASSETS.keys():
+        cols += [a, f"{a}_missing", f"{a}_date", f"{a}_fail"]
 
-    last_warn = ""
-    final = None
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        data, warn = fetch_once()
-        final = data
-        last_warn = warn
+    return df[cols]
 
-        # 成功判定：少なくとも1つは取れている
-        ok_any = any(v["src"] != "missing" for v in data.values())
-        if ok_any:
-            break
 
-        # 失敗時の待ち（指数バックオフ＋ジッター）
-        sleep_sec = BASE_SLEEP_SEC * (2 ** (attempt - 1))
-        sleep_sec = sleep_sec * (0.8 + 0.4 * random.random())  # 0.8〜1.2倍
-        sleep_sec = min(sleep_sec, 180)  # 上限3分
-        print(f"[retry] attempt={attempt}/{MAX_RETRIES} warn={warn} sleep={sleep_sec:.1f}s")
-        time.sleep(sleep_sec)
-
-    # CSV行を作る（既存仕様を維持しつつ、理由ログ列を追加）
-    row = {
-        "timestamp_jst": ts_jst,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "run_warn": last_warn,
-    }
-    for asset, _ in ASSETS:
-        row[f"{asset}_price"] = _safe_float(final[asset]["price"])
-        row[f"{asset}_date"] = final[asset]["date"]
-        row[f"{asset}_src"] = final[asset]["src"]
-        row[f"{asset}_fail"] = final[asset]["fail"]
-
-        # 表示ログ（あなたの形式に寄せる）
-        status = "✅" if final[asset]["src"] != "missing" else "❌"
-        print(f"[{final[asset]['src']}] {asset}: {row[f'{asset}_price']} ({row[f'{asset}_date']}) {status} fail={final[asset]['fail']}")
-
+def append_csv(row: Dict[str, object]) -> None:
     out_df = pd.DataFrame([row])
+    out_df = _ensure_schema(out_df)
 
-    # 追記保存（ヘッダは初回だけ）
-    exists = os.path.exists(OUT_CSV)
-    out_df.to_csv(OUT_CSV, mode="a", index=False, header=not exists)
+    header = not (os.path.exists(OUT_CSV) and os.path.getsize(OUT_CSV) > 0)
+    out_df.to_csv(
+        OUT_CSV,
+        mode="a",
+        index=False,
+        header=header,
+        encoding=ENCODING,
+        quoting=CSV_QUOTING,
+        lineterminator=LINE_TERMINATOR,  # ← 正しい引数名
+    )
 
+
+def collect() -> None:
+    print("=== yfinance market fetch ===")
+    ts = now_jst_str()
+    print(f"timestamp_jst: {ts}")
+
+    row: Dict[str, object] = {"timestamp_jst": ts}
+
+    for asset, ticker in ASSETS.items():
+        price, miss, d, fail = fetch_one_ticker(ticker)
+        row[asset] = float(price)
+        row[f"{asset}_missing"] = int(miss)
+        row[f"{asset}_date"] = d if d else float("nan")
+        row[f"{asset}_fail"] = fail if fail else float("nan")
+
+        mark = "✅" if miss == 0 else "❌"
+        print(f"[yfinance] {asset}({ticker}): {price} ({d}) {mark} fail={fail}")
+
+    append_csv(row)
     print(f"=== saved -> {OUT_CSV} ===")
-
-    # collector自体は「欠損で落とす」責務を持たせない（監視は monitor が担当）
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(collect())
+    collect()
