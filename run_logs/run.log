@@ -27,3 +27,55 @@ YF.download() has changed argument auto_adjust default to True
 
 ✅ OK: 欠損なし
 === End ===
+=== Run at Sat Jan 17 06:56:10 UTC 2026 UTC ===
+Python 3.11.14
+pip 25.3 from /opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pip (python 3.11)
+--- pip freeze ---
+beautifulsoup4==4.14.3
+certifi==2026.1.4
+charset-normalizer==3.4.4
+frozendict==2.4.7
+idna==3.11
+multitasking==0.0.12
+numpy==2.4.1
+pandas==2.2.3
+peewee==3.19.0
+platformdirs==4.5.1
+python-dateutil==2.9.0.post0
+pytz==2025.2
+requests==2.32.5
+six==1.17.0
+soupsieve==2.8.1
+typing_extensions==4.15.0
+tzdata==2025.3
+urllib3==2.6.3
+yfinance==0.2.54
+------------------
+MODE=market
+------------------
+--- collector ---
+=== yfinance market fetch ===
+timestamp_jst: 2026-01-17 15:56:11
+YF.download() has changed argument auto_adjust default to True
+[yfinance] USDJPY(JPY=X): 158.5959930419922 (2026-01-16) ✅ fail=
+[yfinance] BTC(BTC-USD): 95203.9296875 (2026-01-17) ✅ fail=
+[yfinance] Gold(GC=F): 4588.39990234375 (2026-01-16) ✅ fail=
+[yfinance] US10Y(^TNX): 4.230999946594238 (2026-01-16) ✅ fail=
+[yfinance] Oil(CL=F): 59.439998626708984 (2026-01-16) ✅ fail=
+[yfinance] VIX(^VIX): 15.859999656677246 (2026-01-16) ✅ fail=
+=== saved -> market_yfinance_log.csv ===
+--- monitor ---
+
+============================================================
+📡 Market Monitor
+============================================================
+[ Latest ] 2026-01-17 15:56:11
+ - USDJPY:   158.595993 (✅正常) date=2026-01-16
+ - BTC  : 95203.929688 (✅正常) date=2026-01-17
+ - Gold :  4588.399902 (✅正常) date=2026-01-16
+ - US10Y:     4.231000 (✅正常) date=2026-01-16
+ - Oil  :    59.439999 (✅正常) date=2026-01-16
+ - VIX  :    15.860000 (✅正常) date=2026-01-16
+
+✅ OK: 欠損なし
+=== End (market) ===
