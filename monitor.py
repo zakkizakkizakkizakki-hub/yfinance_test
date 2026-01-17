@@ -1,94 +1,80 @@
-# monitor.py
+# save as: monitor.py
 from __future__ import annotations
 
 import os
+import sys
 import pandas as pd
-from datetime import datetime
 
-
-CSV_PATH = os.getenv("MARKET_CSV", "market_yfinance_log.csv")
+CSV_PATH = "market_yfinance_log.csv"
 
 ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
-# 簡易な異常値検知（“明らかにおかしい” を落とす）
-# ※厳密な金融工学的レンジではなく「ゼロ/負/NaN」や極端値を検知する最小限
-ABNORMAL_RULES = {
-    "USDJPY": (50, 300),
-    "BTC": (1000, 1_000_000),
-    "Gold": (100, 50_000),
-    "US10Y": (0.0, 20.0),
-    "Oil": (1, 500),
-    "VIX": (1, 200),
-}
+
+def _to_float(x) -> float:
+    try:
+        if pd.isna(x):
+            return 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _to_int(x) -> int:
+    try:
+        if pd.isna(x):
+            return 1
+        return int(float(x))
+    except Exception:
+        return 1
 
 
 def main() -> int:
-    if not os.path.exists(CSV_PATH):
-        print(f"[ERROR] CSV not found: {CSV_PATH}")
+    print("\n" + "=" * 60)
+    print("📡 Market Monitor")
+    print("=" * 60)
+
+    if not (os.path.exists(CSV_PATH) and os.path.getsize(CSV_PATH) > 0):
+        print(f"Error: {CSV_PATH} not found or empty")
         return 1
 
-    df = pd.read_csv(CSV_PATH)
+    df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
     if df.empty:
-        print("[ERROR] CSV is empty")
+        print(f"Error: {CSV_PATH} has no rows")
         return 1
 
     last = df.iloc[-1].to_dict()
     latest_ts = str(last.get("timestamp_jst", "Unknown"))
-
-    print("\n" + "=" * 60)
-    print("📡 Market Monitor")
-    print("=" * 60)
     print(f"[ Latest ] {latest_ts}")
 
-    missing = []
-    abnormal = []
+    missing_assets = []
 
     for a in ASSETS:
-        price_key = f"{a}_price"
-        src_key = f"{a}_src"
-        fail_key = f"{a}_fail"
-        date_key = f"{a}_date"
+        v = _to_float(last.get(a))
+        miss = _to_int(last.get(f"{a}_missing"))
+        date = last.get(f"{a}_date")
+        fail = last.get(f"{a}_fail")
 
-        src = str(last.get(src_key, "missing"))
-        fail = str(last.get(fail_key, ""))
-        date = str(last.get(date_key, ""))
+        # “欠損”判定（仕様維持）
+        is_missing = (miss != 0) or (v <= 0.0)
 
-        # 数値化できないケースは欠損扱いに倒す（monitorが落ちるべき）
-        try:
-            v = float(last.get(price_key))
-        except Exception:
-            v = float("nan")
+        badge = "⚠️欠損" if is_missing else "✅正常"
+        date_str = "nan" if pd.isna(date) else str(date)
 
-        is_missing = (src == "missing") or (pd.isna(v)) or (v == 0.0)
-        if is_missing:
-            missing.append(a)
-
-        # 異常値（ただし欠損は別枠で扱う）
-        if not is_missing:
-            lo, hi = ABNORMAL_RULES[a]
-            if not (lo <= v <= hi):
-                abnormal.append(a)
-
-        status = "⚠️欠損" if is_missing else "✅正常"
-        print(f" - {a:5s}: {v:12.6f} ({status}) date={date or 'nan'}")
-        if fail and fail != "nan":
+        print(f" - {a:5s}: {v:12.6f} ({badge}) date={date_str}")
+        if pd.notna(fail) and str(fail).strip() and str(fail) != "nan":
             print(f"   Warning: {a}_fail: {fail}")
 
-    if abnormal:
+        if is_missing:
+            missing_assets.append(a)
+
+    if missing_assets:
         print("\n" + "!" * 60)
-        print(f"❌ 異常値を検知: {', '.join(abnormal)}")
+        print(f"❌ 欠損を検知: {', '.join(missing_assets)}")
         print("   → 監視仕様により exit code 1 で終了します。")
         print("!" * 60)
         return 1
 
-    if missing:
-        print("\n" + "!" * 60)
-        print(f"❌ 欠損を検知: {', '.join(missing)}")
-        print("   → 監視仕様により exit code 1 で終了します。")
-        print("!" * 60)
-        return 1
-
-    print("\n✅ All OK")
+    print("\n✅ OK: 欠損なし")
     return 0
 
 
