@@ -1,15 +1,12 @@
-# save as: .github/workflows/market.yml
-name: market
+name: market-yfinance
 
 on:
-  workflow_dispatch:
   schedule:
-    # GitHub Actions cron is UTC
-    # 例: JST 07:30 = UTC 22:30
-    - cron: "30 22 * * *"
+    - cron: "0 * * * *"  # 1時間ごと（必要なら調整）
+  workflow_dispatch:
 
 concurrency:
-  group: market-log
+  group: market-yfinance
   cancel-in-progress: true
 
 jobs:
@@ -24,14 +21,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Pull latest (before modifying files)
+      # ★ここが重要: 作業前にpull（あとでpullすると「unstaged changes」事故になりやすい）
+      - name: Pull latest (before run)
         run: |
           set -euo pipefail
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git pull --rebase origin main
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -55,14 +53,12 @@ jobs:
         if: ${{ always() }}
         run: |
           set -euo pipefail
-
-          # 生成物（無ければOK）
-          test -f market_yfinance_log.csv || true
-          test -f retry_trials.csv || true
-          test -f yahoo_http_probe.jsonl || true
+          # 無い場合でも落ちない
+          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
+          test -f retry_trials.csv || touch retry_trials.csv
+          test -f yahoo_http_probe.jsonl || touch yahoo_http_probe.jsonl
 
           git add -A
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-
           git commit -m "Update market logs"
           git push origin main
