@@ -1,37 +1,42 @@
 # save as: monitor.py
 from __future__ import annotations
 
-import os
-import sys
+import math
+from pathlib import Path
 import pandas as pd
 
-CSV_PATH = "market_yfinance_log.csv"
+CSV_PATH = Path("market_yfinance_log.csv")
+ENC = "utf-8-sig"
 
 ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
 
-def to_float(x) -> float:
+def _bad(v) -> bool:
     try:
-        v = float(x)
-        if pd.isna(v):
-            return 0.0
-        return v
+        x = float(v)
     except Exception:
-        return 0.0
+        return True
+    return (not math.isfinite(x)) or (x <= 0.0)
 
 
 def main() -> int:
-    print("\n============================================================")
+    print("\n" + "=" * 60)
     print("📡 Market Monitor")
-    print("============================================================")
+    print("=" * 60)
 
-    if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
-        print(f"❌ {CSV_PATH} がありません（または空です）")
+    if not CSV_PATH.exists() or CSV_PATH.stat().st_size == 0:
+        print(f"❌ CSVが存在しない/空です: {CSV_PATH}")
         return 1
 
-    df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
+    try:
+        df = pd.read_csv(CSV_PATH, encoding=ENC)
+    except Exception as e:
+        print("❌ CSVの読み取りに失敗しました（CSVが壊れている可能性）")
+        print(f"原因: {type(e).__name__}: {e}")
+        return 1
+
     if df.empty:
-        print(f"❌ {CSV_PATH} が空です")
+        print("❌ CSVは読めましたが中身が空です")
         return 1
 
     last = df.iloc[-1].to_dict()
@@ -40,27 +45,34 @@ def main() -> int:
 
     missing = []
     for a in ASSETS:
-        v = to_float(last.get(a, 0.0))
-        fail = str(last.get(f"{a}_fail", "") or "")
-        d = str(last.get(f"{a}_date", "") or "")
-        is_missing = (v <= 0.0) or (fail.strip() != "")
+        v = last.get(a, 0.0)
+        ok = int(last.get(f"{a}_ok", 0) or 0)
+        date = last.get(f"{a}_date", "")
+        fail = last.get(f"{a}_fail", "")
 
-        mark = "⚠️欠損" if is_missing else "✅正常"
-        print(f" - {a:<5}: {v:12.6f} ({mark}) date={d if d else 'nan'}")
+        status = "✅正常"
+        if ok != 1 or _bad(v):
+            status = "⚠️欠損"
+            missing.append(a)
+
+        # 表示（初心者向けに “fail理由”も出す）
+        try:
+            fv = float(v)
+        except Exception:
+            fv = v
+
+        print(f" - {a:<5}: {fv:>12} ({status}) date={date if date else 'nan'}")
         if fail:
             print(f"   Warning: {a}_fail: {fail}")
 
-        if is_missing:
-            missing.append(a)
-
     if missing:
-        print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("\n" + "!" * 60)
         print(f"❌ 欠損を検知: {', '.join(missing)}")
         print("   → 監視仕様により exit code 1 で終了します。")
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!" * 60)
         return 1
 
-    print("\n✅ 全資産OK（欠損なし）")
+    print("\n✅ すべて正常です（欠損なし）")
     return 0
 
 
