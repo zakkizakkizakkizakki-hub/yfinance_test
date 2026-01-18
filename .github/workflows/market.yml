@@ -1,13 +1,14 @@
+# save as: .github/workflows/market.yml
 name: market
 
 on:
   workflow_dispatch:
   schedule:
-    # UTCです（例：毎時0分）
-    - cron: '0 * * * *'
+    # 例: 1日4回（UTC）必要に応じて変更OK
+    - cron: "0 */6 * * *"
 
 concurrency:
-  group: market
+  group: market-log
   cancel-in-progress: true
 
 jobs:
@@ -19,44 +20,45 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install "pandas==2.2.3" "yfinance==0.2.54" "requests==2.32.5"
+          pip install "pandas==2.2.3" "yfinance==0.2.54"
 
-      - name: Run collector (retry experiment)
+      - name: Run collector
         run: |
           set -euo pipefail
           python market_yfinance_collector.py
 
-      - name: Run monitor (fail if missing)
+      - name: Run monitor (fail on missing)
         run: |
           set -euo pipefail
           python monitor.py
 
-      - name: Commit results
+      - name: Upload artifacts
         if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-logs
+          path: |
+            market_yfinance_log.csv
+            retry_trials.csv
+          retention-days: 14
+
+      - name: Commit & push CSVs
         run: |
           set -euo pipefail
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
 
-          git pull --rebase origin main || { echo "git pull --rebase failed. abort."; git rebase --abort || true; exit 1; }
+          git add market_yfinance_log.csv retry_trials.csv || true
+          git diff --cached --quiet && echo "No changes" && exit 0
 
-          # 生成物が無くても落ちない
-          test -f market_yfinance_log.csv || true
-          test -f retry_trials.csv || true
-          test -f yahoo_http_probe.jsonl || true
-
-          git add -A
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "Update market logs"
-          git push origin main
+          git push
