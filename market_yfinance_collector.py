@@ -1,21 +1,20 @@
 # save as: market_yfinance_collector.py
 from __future__ import annotations
 
-import os
-import time
-import json
 import csv
+import os
 import random
-from datetime import datetime, timezone, timedelta
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import pandas as pd
 import yfinance as yf
-import requests
 
 JST = timezone(timedelta(hours=9))
 
-ASSETS = {
+ASSETS: Dict[str, str] = {
     "USDJPY": "JPY=X",
     "BTC": "BTC-USD",
     "Gold": "GC=F",
@@ -24,93 +23,60 @@ ASSETS = {
     "VIX": "^VIX",
 }
 
-OUT_CSV = "market_yfinance_log.csv"
-PROBE_JSONL = "yahoo_http_probe.jsonl"
-TRY_CSV = "retry_trials.csv"
+OUT_CSV = Path("market_yfinance_log.csv")
+RETRY_CSV = Path("retry_trials.csv")
 
 CSV_ENCODING = "utf-8-sig"
-CSV_QUOTING = csv.QUOTE_MINIMAL
 CSV_LINETERMINATOR = "\n"
-
-# ===== 検証用: 待機時間（秒）を候補として並べる =====
-# 例: 5秒→15秒→45秒→120秒 ... のように強めていく
-RETRY_SCHEDULE_SECONDS = [5, 15, 45, 120]
+CSV_QUOTING = csv.QUOTE_ALL
 
 YF_PERIOD = "7d"
 YF_INTERVAL = "1d"
 
-HTTP_TIMEOUT = 20
-
-# Yahoo側の「実体」(yfinanceが内部で叩くのと同系統)
-# 価格取得の正否というより「429が返ってきてるか」を観測する用途
-YAHOO_PROBE_URLS = [
-    "https://query1.finance.yahoo.com/v7/finance/quote?symbols=JPY=X",
-    "https://query1.finance.yahoo.com/v7/finance/quote?symbols=GC=F",
-    "https://query1.finance.yahoo.com/v7/finance/quote?symbols=^VIX",
-]
+# リトライ設定（検証しやすいように明示）
+RETRIES = 4
+BASE_SLEEP_SEC = 20          # 1回失敗したら最低これだけ待つ
+JITTER_SEC = 10              # 追加で0〜これだけランダム待ち
+BACKOFF_MULT = 2.0           # 失敗が続くと待ち時間を伸ばす
 
 
 def now_jst_str() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def append_jsonl(path: str, obj: dict) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+def _append_retry_row(row: dict) -> None:
+    header_needed = not RETRY_CSV.exists() or RETRY_CSV.stat().st_size == 0
+    with RETRY_CSV.open("a", encoding=CSV_ENCODING, newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "timestamp_jst",
+                "asset",
+                "ticker",
+                "attempt",
+                "ok",
+                "fail_reason",
+                "rows",
+                "last_date",
+            ],
+            quoting=CSV_QUOTING,
+            lineterminator=CSV_LINETERMINATOR,
+        )
+        if header_needed:
+            w.writeheader()
+        w.writerow(row)
 
 
-def safe_float(x) -> float:
-    try:
-        v = float(x)
-        if pd.isna(v):
-            return 0.0
-        return v
-    except Exception:
-        return 0.0
+def _sleep(attempt: int) -> None:
+    # 0回目失敗→BASE、1回目失敗→BASE*2、2回目失敗→BASE*4 …（+ jitter）
+    sec = BASE_SLEEP_SEC * (BACKOFF_MULT ** max(0, attempt - 1))
+    sec += random.uniform(0, JITTER_SEC)
+    time.sleep(sec)
 
 
-def probe_yahoo_http(tag: str) -> None:
+def fetch_one(ticker: str) -> Tuple[Optional[float], str, str]:
     """
-    Yahoo側に実際にHTTPで当てて、status(200/429等)とヘッダを記録する。
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/html,*/*",
-    }
-    for url in YAHOO_PROBE_URLS:
-        t0 = time.time()
-        try:
-            r = requests.get(url, timeout=HTTP_TIMEOUT, headers=headers)
-            dt = int((time.time() - t0) * 1000)
-            body = (r.text or "")[:200]
-            rec = {
-                "ts_jst": now_jst_str(),
-                "tag": tag,
-                "url": url,
-                "status": r.status_code,
-                "elapsed_ms": dt,
-                "content_type": r.headers.get("Content-Type", ""),
-                "content_length": r.headers.get("Content-Length", ""),
-                "server": r.headers.get("Server", ""),
-                "via": r.headers.get("Via", ""),
-                "body_head": body,
-            }
-            append_jsonl(PROBE_JSONL, rec)
-        except Exception as e:
-            rec = {
-                "ts_jst": now_jst_str(),
-                "tag": tag,
-                "url": url,
-                "status": None,
-                "error": f"{type(e).__name__}: {e}",
-            }
-            append_jsonl(PROBE_JSONL, rec)
-
-
-def yfinance_fetch_one(ticker: str) -> Tuple[float, str, str]:
-    """
-    価格, fail_reason, date_str
-    取れなければ (0.0, "EmptyDF" or exception, "")
+    return: (price or None, fail_reason, date_str)
     """
     try:
         df = yf.download(
@@ -120,104 +86,107 @@ def yfinance_fetch_one(ticker: str) -> Tuple[float, str, str]:
             progress=False,
         )
         if df is None or df.empty:
-            return 0.0, "EmptyDF", ""
-        # Close優先
+            return None, "EmptyDF", ""
+
+        # Closeを優先
         if "Close" in df.columns:
             s = df["Close"]
             if isinstance(s, pd.DataFrame):
                 s = s.iloc[:, 0]
+            s = pd.to_numeric(s, errors="coerce").dropna()
         else:
-            s = df.iloc[:, 0]
-        s = pd.to_numeric(s, errors="coerce").dropna()
+            s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+
         if s.empty:
-            return 0.0, "NoDataAfterDrop", ""
+            return None, "NoNumericData", ""
+
         price = float(s.iloc[-1])
         if not (price > 0):
-            return 0.0, "NonPositive", ""
+            return None, "NonPositive", ""
+
         date_str = str(s.index[-1])[:10]
         return price, "", date_str
+
     except Exception as e:
-        return 0.0, type(e).__name__, ""
+        return None, type(e).__name__, ""
 
 
-def collect_once(tag: str) -> Dict[str, object]:
-    """
-    1回分の収集結果（成功/失敗含む）を返す。
-    """
-    row: Dict[str, object] = {"timestamp_jst": now_jst_str(), "tag": tag}
-    # 先にHTTP観測（証拠取り）
-    probe_yahoo_http(tag=f"collector:{tag}")
+def collect() -> int:
+    ts = now_jst_str()
+    print("=== yfinance market fetch ===")
+    print(f"timestamp_jst: {ts}")
+
+    # 固定スキーマ（ここを変えない限り、CSVは壊れません）
+    row: dict = {"timestamp_jst": ts}
+    for name, ticker in ASSETS.items():
+        row[f"{name}_ticker"] = ticker
+        row[name] = 0.0
+        row[f"{name}_date"] = ""
+        row[f"{name}_ok"] = 0
+        row[f"{name}_fail"] = ""
 
     for name, ticker in ASSETS.items():
-        price, fail, d = yfinance_fetch_one(ticker)
-        row[name] = price
-        row[f"{name}_fail"] = fail or ""
-        row[f"{name}_date"] = d or ""
-        row[f"{name}_missing"] = 1 if (price <= 0 or fail) else 0
-    return row
+        last_fail = ""
+        last_date = ""
+        got: Optional[float] = None
 
+        for attempt in range(1, RETRIES + 1):
+            price, fail, date_str = fetch_one(ticker)
 
-def append_csv_row(path: str, row: Dict[str, object]) -> None:
-    df = pd.DataFrame([row])
-    header = not (os.path.exists(path) and os.path.getsize(path) > 0)
-    df.to_csv(
-        path,
-        mode="a",
-        index=False,
-        header=header,
-        encoding=CSV_ENCODING,
-        quoting=CSV_QUOTING,
-        lineterminator=CSV_LINETERMINATOR,  # ← pandasはこれが正しい
-    )
+            ok = int(price is not None and price > 0)
+            _append_retry_row(
+                {
+                    "timestamp_jst": ts,
+                    "asset": name,
+                    "ticker": ticker,
+                    "attempt": attempt,
+                    "ok": ok,
+                    "fail_reason": fail,
+                    "rows": 0,
+                    "last_date": date_str,
+                }
+            )
 
+            if ok:
+                got = float(price)
+                last_date = date_str
+                last_fail = ""
+                break
 
-def main() -> int:
-    print("=== yfinance retry interval experiment ===")
-    print(f"timestamp_jst: {now_jst_str()}")
-    print(f"retry_schedule_seconds: {RETRY_SCHEDULE_SECONDS}")
+            last_fail = fail or "UnknownFail"
+            last_date = date_str or ""
+            _sleep(attempt)
 
-    # 各トライの要約を残す（成功率をあとで見れる）
-    for i, wait_s in enumerate(RETRY_SCHEDULE_SECONDS, start=1):
-        tag = f"try{i}_wait{wait_s}s"
+        if got is not None:
+            row[name] = got
+            row[f"{name}_date"] = last_date
+            row[f"{name}_ok"] = 1
+            row[f"{name}_fail"] = ""
+            print(f"[yfinance] {name}({ticker}): {got} ({last_date}) ✅")
+        else:
+            row[name] = 0.0
+            row[f"{name}_date"] = ""
+            row[f"{name}_ok"] = 0
+            row[f"{name}_fail"] = last_fail or "EmptyDF"
+            print(f"[missing] {name}({ticker}): 0.0 () ❌ fail={row[f'{name}_fail']}")
 
-        # 1回実行
-        row = collect_once(tag=tag)
+    # 出力（クォート固定・列固定）
+    header_needed = not OUT_CSV.exists() or OUT_CSV.stat().st_size == 0
+    with OUT_CSV.open("a", encoding=CSV_ENCODING, newline="") as f:
+        fieldnames = list(row.keys())
+        w = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            quoting=CSV_QUOTING,
+            lineterminator=CSV_LINETERMINATOR,
+        )
+        if header_needed:
+            w.writeheader()
+        w.writerow(row)
 
-        # ログ（試行サマリ）に追記
-        miss = 0
-        for a in ASSETS.keys():
-            miss += int(row.get(f"{a}_missing", 1))
-        row["missing_assets_count"] = miss
-        append_csv_row(TRY_CSV, row)
-
-        # 本番ログにも追記（※仕様を壊さない：同じ列名で追記）
-        append_csv_row(OUT_CSV, row)
-
-        # コンソール表示（GitHub Actionsで見やすい）
-        print(f"\n--- {tag} ---")
-        for a, t in ASSETS.items():
-            v = row.get(a, 0.0)
-            fail = row.get(f"{a}_fail", "")
-            d = row.get(f"{a}_date", "")
-            ok = "✅" if (safe_float(v) > 0 and not fail) else "❌"
-            print(f"[yfinance] {a}({t}): {v} ({d}) {ok} fail={fail}")
-        print(f"missing_assets_count: {miss}")
-
-        # すべて揃ったら実験を早期終了（無駄打ち防止）
-        if miss == 0:
-            print("All assets succeeded. Stop early.")
-            return 0
-
-        # 次の試行まで待機（ジッター少し足す）
-        jitter = random.uniform(0.0, 2.0)
-        sleep_s = wait_s + jitter
-        print(f"sleeping {sleep_s:.1f}s before next try...")
-        time.sleep(sleep_s)
-
-    # 最後まで揃わなかった
-    print("Experiment finished, but some assets still missing.")
-    return 0  # ← 実験自体は成功（監視で落とすのはmonitor側）
+    print(f"=== saved -> {OUT_CSV.name} ===")
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(collect())
