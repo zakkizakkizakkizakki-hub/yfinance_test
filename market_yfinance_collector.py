@@ -1,18 +1,26 @@
 # save as: market_yfinance_collector.py
 from __future__ import annotations
 
-import csv
 import os
-import random
+import csv
 import time
+import random
+import shutil
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import pandas as pd
 import yfinance as yf
 
+# =========================
+# Config
+# =========================
 JST = timezone(timedelta(hours=9))
+
+OUT_CSV = "market_yfinance_log.csv"
+CSV_ENCODING = "utf-8-sig"
+CSV_QUOTING = csv.QUOTE_ALL
+CSV_LINETERMINATOR = "\n"  # NOTE: pandas uses "lineterminator" (not line_terminator)
 
 ASSETS: Dict[str, str] = {
     "USDJPY": "JPY=X",
@@ -23,168 +31,195 @@ ASSETS: Dict[str, str] = {
     "VIX": "^VIX",
 }
 
-OUT_CSV = Path("market_yfinance_log.csv")
-RETRY_CSV = Path("retry_trials.csv")
-
-CSV_ENCODING = "utf-8-sig"
-CSV_LINETERMINATOR = "\n"
-CSV_QUOTING = csv.QUOTE_ALL
-
+# yfinance fetch parameters
 YF_PERIOD = "7d"
 YF_INTERVAL = "1d"
 
-# リトライ設定（検証しやすいように明示）
-RETRIES = 4
-BASE_SLEEP_SEC = 20          # 1回失敗したら最低これだけ待つ
-JITTER_SEC = 10              # 追加で0〜これだけランダム待ち
-BACKOFF_MULT = 2.0           # 失敗が続くと待ち時間を伸ばす
+# retry behavior
+RETRY_MAX = 4                 # total attempts per symbol
+BASE_SLEEP_SEC = 8            # base wait between retries
+JITTER_SEC = (0.5, 2.5)       # random add
+BATCH_SLEEP_SEC = 4           # small wait between symbols
+
+# =========================
+# CSV Schema (固定: 31列)
+# =========================
+def expected_columns() -> List[str]:
+    cols = ["timestamp_jst"]
+    for name in ASSETS.keys():
+        cols += [
+            name,                        # price
+            f"{name}_missing",           # 0/1
+            f"{name}_source",            # yfinance/missing
+            f"{name}_date",              # YYYY-MM-DD
+            f"{name}_fail",              # reason string
+        ]
+    return cols
 
 
+# =========================
+# Utilities
+# =========================
 def now_jst_str() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _append_retry_row(row: dict) -> None:
-    header_needed = not RETRY_CSV.exists() or RETRY_CSV.stat().st_size == 0
-    with RETRY_CSV.open("a", encoding=CSV_ENCODING, newline="") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "timestamp_jst",
-                "asset",
-                "ticker",
-                "attempt",
-                "ok",
-                "fail_reason",
-                "rows",
-                "last_date",
-            ],
-            quoting=CSV_QUOTING,
-            lineterminator=CSV_LINETERMINATOR,
-        )
-        if header_needed:
-            w.writeheader()
-        w.writerow(row)
+def file_has_data(path: str) -> bool:
+    return os.path.exists(path) and os.path.getsize(path) > 0
 
 
-def _sleep(attempt: int) -> None:
-    # 0回目失敗→BASE、1回目失敗→BASE*2、2回目失敗→BASE*4 …（+ jitter）
-    sec = BASE_SLEEP_SEC * (BACKOFF_MULT ** max(0, attempt - 1))
-    sec += random.uniform(0, JITTER_SEC)
-    time.sleep(sec)
-
-
-def fetch_one(ticker: str) -> Tuple[Optional[float], str, str]:
+def quarantine_if_header_mismatch(path: str, cols_expected: List[str]) -> None:
     """
-    return: (price or None, fail_reason, date_str)
+    CSVが既に存在する場合、ヘッダを検査する。
+    - 期待ヘッダと一致しない → 退避（quarantine）して新規作成に切り替える
     """
+    if not file_has_data(path):
+        return
+
     try:
-        df = yf.download(
-            ticker,
-            period=YF_PERIOD,
-            interval=YF_INTERVAL,
-            progress=False,
-        )
-        if df is None or df.empty:
-            return None, "EmptyDF", ""
+        with open(path, "r", encoding=CSV_ENCODING, newline="") as f:
+            first_line = f.readline()
+        if not first_line:
+            return
 
-        # Closeを優先
-        if "Close" in df.columns:
-            s = df["Close"]
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[:, 0]
-            s = pd.to_numeric(s, errors="coerce").dropna()
-        else:
-            s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+        # CSVとしてヘッダを正しく分割（QUOTE_ALLでも安全）
+        header = next(csv.reader([first_line]))
+        if header == cols_expected:
+            return
 
-        if s.empty:
-            return None, "NoNumericData", ""
-
-        price = float(s.iloc[-1])
-        if not (price > 0):
-            return None, "NonPositive", ""
-
-        date_str = str(s.index[-1])[:10]
-        return price, "", date_str
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        bad = f"{os.path.splitext(path)[0]}.bad_{ts}{os.path.splitext(path)[1]}"
+        shutil.move(path, bad)
+        print(f"[preflight] header mismatch -> quarantined: {path} -> {bad}")
+        print(f"[preflight] expected cols={len(cols_expected)}, got={len(header)}")
 
     except Exception as e:
-        return None, type(e).__name__, ""
+        # 読めない/壊れてる等も隔離
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        bad = f"{os.path.splitext(path)[0]}.bad_{ts}{os.path.splitext(path)[1]}"
+        try:
+            shutil.move(path, bad)
+            print(f"[preflight] header read failed -> quarantined: {path} -> {bad}")
+        except Exception:
+            pass
+        print(f"[preflight] reason: {type(e).__name__}: {e}")
 
 
-def collect() -> int:
-    ts = now_jst_str()
-    print("=== yfinance market fetch ===")
-    print(f"timestamp_jst: {ts}")
+def sleep_jitter(base: float) -> None:
+    time.sleep(base + random.uniform(*JITTER_SEC))
 
-    # 固定スキーマ（ここを変えない限り、CSVは壊れません）
-    row: dict = {"timestamp_jst": ts}
-    for name, ticker in ASSETS.items():
-        row[f"{name}_ticker"] = ticker
-        row[name] = 0.0
-        row[f"{name}_date"] = ""
-        row[f"{name}_ok"] = 0
-        row[f"{name}_fail"] = ""
 
-    for name, ticker in ASSETS.items():
-        last_fail = ""
-        last_date = ""
-        got: Optional[float] = None
+# =========================
+# yfinance fetch
+# =========================
+def fetch_one(ticker: str) -> Tuple[Optional[float], str, str]:
+    """
+    Returns: (price, fail_reason, date_str)
+    - price is None on failure
+    """
+    last_err = ""
+    for attempt in range(1, RETRY_MAX + 1):
+        try:
+            if attempt > 1:
+                # Exponential-ish backoff
+                wait = BASE_SLEEP_SEC * (attempt - 1)
+                sleep_jitter(wait)
 
-        for attempt in range(1, RETRIES + 1):
-            price, fail, date_str = fetch_one(ticker)
-
-            ok = int(price is not None and price > 0)
-            _append_retry_row(
-                {
-                    "timestamp_jst": ts,
-                    "asset": name,
-                    "ticker": ticker,
-                    "attempt": attempt,
-                    "ok": ok,
-                    "fail_reason": fail,
-                    "rows": 0,
-                    "last_date": date_str,
-                }
+            df = yf.download(
+                ticker,
+                period=YF_PERIOD,
+                interval=YF_INTERVAL,
+                progress=False,
             )
 
-            if ok:
-                got = float(price)
-                last_date = date_str
-                last_fail = ""
-                break
+            if df is None or df.empty:
+                last_err = "EmptyDF"
+                continue
 
-            last_fail = fail or "UnknownFail"
-            last_date = date_str or ""
-            _sleep(attempt)
+            # Close優先（複数列のことがあるので安全に）
+            if "Close" in df.columns:
+                s = df["Close"]
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+            else:
+                s = df.iloc[:, 0]
 
-        if got is not None:
-            row[name] = got
-            row[f"{name}_date"] = last_date
-            row[f"{name}_ok"] = 1
-            row[f"{name}_fail"] = ""
-            print(f"[yfinance] {name}({ticker}): {got} ({last_date}) ✅")
-        else:
+            series = pd.to_numeric(s, errors="coerce").dropna()
+            if series.empty:
+                last_err = "NoDataAfterDrop"
+                continue
+
+            price = float(series.iloc[-1])
+            if not (price > 0):
+                last_err = "NonPositive"
+                continue
+
+            # date
+            idx = series.index[-1]
+            date_str = str(idx)[:10]
+
+            # rounding (表示用)
+            if ticker == "JPY=X":
+                price = round(price, 6)
+            else:
+                price = round(price, 6)
+
+            return price, "", date_str
+
+        except Exception as e:
+            # yfinance が RateLimit のときもここに来る（例: YFRateLimitError）
+            last_err = type(e).__name__
+            continue
+
+    return None, last_err or "UnknownError", ""
+
+
+# =========================
+# Main
+# =========================
+def collect() -> int:
+    print("=== yfinance market fetch ===")
+
+    cols = expected_columns()
+    quarantine_if_header_mismatch(OUT_CSV, cols)
+
+    row: Dict[str, object] = {"timestamp_jst": now_jst_str()}
+
+    for name, ticker in ASSETS.items():
+        sleep_jitter(BATCH_SLEEP_SEC)
+
+        price, fail, date_str = fetch_one(ticker)
+
+        if price is None:
             row[name] = 0.0
+            row[f"{name}_missing"] = 1
+            row[f"{name}_source"] = "missing"
             row[f"{name}_date"] = ""
-            row[f"{name}_ok"] = 0
-            row[f"{name}_fail"] = last_fail or "EmptyDF"
+            row[f"{name}_fail"] = fail or "EmptyDF"
             print(f"[missing] {name}({ticker}): 0.0 () ❌ fail={row[f'{name}_fail']}")
+        else:
+            row[name] = float(price)
+            row[f"{name}_missing"] = 0
+            row[f"{name}_source"] = "yfinance"
+            row[f"{name}_date"] = date_str
+            row[f"{name}_fail"] = ""
+            print(f"[yfinance] {name}({ticker}): {price} ({date_str}) ✅ fail=")
 
-    # 出力（クォート固定・列固定）
-    header_needed = not OUT_CSV.exists() or OUT_CSV.stat().st_size == 0
-    with OUT_CSV.open("a", encoding=CSV_ENCODING, newline="") as f:
-        fieldnames = list(row.keys())
-        w = csv.DictWriter(
-            f,
-            fieldnames=fieldnames,
-            quoting=CSV_QUOTING,
-            lineterminator=CSV_LINETERMINATOR,
-        )
-        if header_needed:
-            w.writeheader()
-        w.writerow(row)
+    # 31列固定で出力
+    out_df = pd.DataFrame([row]).reindex(columns=cols)
 
-    print(f"=== saved -> {OUT_CSV.name} ===")
+    header = not file_has_data(OUT_CSV)
+    out_df.to_csv(
+        OUT_CSV,
+        mode="a",
+        index=False,
+        header=header,
+        encoding=CSV_ENCODING,
+        quoting=CSV_QUOTING,
+        lineterminator=CSV_LINETERMINATOR,
+    )
+
+    print(f"=== saved -> {OUT_CSV} ===")
     return 0
 
 
