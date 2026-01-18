@@ -10,71 +10,57 @@ CSV_PATH = "market_yfinance_log.csv"
 ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
 
-def _to_float(x) -> float:
+def to_float(x) -> float:
     try:
-        if pd.isna(x):
+        v = float(x)
+        if pd.isna(v):
             return 0.0
-        return float(x)
+        return v
     except Exception:
         return 0.0
 
 
-def _to_int(x) -> int:
-    try:
-        if pd.isna(x):
-            return 1
-        return int(float(x))
-    except Exception:
-        return 1
-
-
 def main() -> int:
-    print("\n" + "=" * 60)
+    print("\n============================================================")
     print("📡 Market Monitor")
-    print("=" * 60)
+    print("============================================================")
 
-    if not (os.path.exists(CSV_PATH) and os.path.getsize(CSV_PATH) > 0):
-        print(f"Error: {CSV_PATH} not found or empty")
+    if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
+        print(f"❌ {CSV_PATH} がありません（または空です）")
         return 1
 
     df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
     if df.empty:
-        print(f"Error: {CSV_PATH} has no rows")
+        print(f"❌ {CSV_PATH} が空です")
         return 1
 
     last = df.iloc[-1].to_dict()
-    latest_ts = str(last.get("timestamp_jst", "Unknown"))
-    print(f"[ Latest ] {latest_ts}")
+    ts = str(last.get("timestamp_jst", "Unknown"))
+    print(f"[ Latest ] {ts}")
 
-    missing_assets = []
-
+    missing = []
     for a in ASSETS:
-        v = _to_float(last.get(a))
-        miss = _to_int(last.get(f"{a}_missing"))
-        date = last.get(f"{a}_date")
-        fail = last.get(f"{a}_fail")
+        v = to_float(last.get(a, 0.0))
+        fail = str(last.get(f"{a}_fail", "") or "")
+        d = str(last.get(f"{a}_date", "") or "")
+        is_missing = (v <= 0.0) or (fail.strip() != "")
 
-        # “欠損”判定（仕様維持）
-        is_missing = (miss != 0) or (v <= 0.0)
-
-        badge = "⚠️欠損" if is_missing else "✅正常"
-        date_str = "nan" if pd.isna(date) else str(date)
-
-        print(f" - {a:5s}: {v:12.6f} ({badge}) date={date_str}")
-        if pd.notna(fail) and str(fail).strip() and str(fail) != "nan":
+        mark = "⚠️欠損" if is_missing else "✅正常"
+        print(f" - {a:<5}: {v:12.6f} ({mark}) date={d if d else 'nan'}")
+        if fail:
             print(f"   Warning: {a}_fail: {fail}")
 
         if is_missing:
-            missing_assets.append(a)
+            missing.append(a)
 
-    if missing_assets:
-        print("\n" + "!" * 60)
-        print(f"❌ 欠損を検知: {', '.join(missing_assets)}")
+    if missing:
+        print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print(f"❌ 欠損を検知: {', '.join(missing)}")
         print("   → 監視仕様により exit code 1 で終了します。")
-        print("!" * 60)
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         return 1
 
-    print("\n✅ OK: 欠損なし")
+    print("\n✅ 全資産OK（欠損なし）")
     return 0
 
 
