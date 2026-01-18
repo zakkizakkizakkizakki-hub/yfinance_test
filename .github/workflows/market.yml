@@ -2,10 +2,9 @@
 name: market
 
 on:
-  workflow_dispatch:
   schedule:
-    # 例: 1日4回（UTC）必要に応じて変更OK
-    - cron: "0 */6 * * *"
+    - cron: '0 * * * *'   # every hour (UTC) ※必要なら後で調整
+  workflow_dispatch:
 
 concurrency:
   group: market-log
@@ -20,11 +19,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ✅ pull を前に（ここでは作業ツリーが汚れていないので安全）
+      - name: Sync (pull --rebase)
+        run: |
+          set -euo pipefail
+          git pull --rebase origin main || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
@@ -32,33 +39,37 @@ jobs:
           pip install "pandas==2.2.3" "yfinance==0.2.54"
 
       - name: Run collector
+        env:
+          PYTHONUTF8: "1"
         run: |
           set -euo pipefail
           python market_yfinance_collector.py
 
-      - name: Run monitor (fail on missing)
+      - name: Run monitor (fail if missing)
+        env:
+          PYTHONUTF8: "1"
         run: |
           set -euo pipefail
           python monitor.py
 
-      - name: Upload artifacts
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: market-logs
-          path: |
-            market_yfinance_log.csv
-            retry_trials.csv
-          retention-days: 14
-
-      - name: Commit & push CSVs
+      - name: Commit and push CSV
         run: |
           set -euo pipefail
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
 
-          git add market_yfinance_log.csv retry_trials.csv || true
-          git diff --cached --quiet && echo "No changes" && exit 0
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
 
-          git commit -m "Update market logs"
-          git push
+          # 重要: 生成物を追加
+          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
+          git add -A
+
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update market log"
+
+          # push が弾かれた時の保険（--autostash で pull 事故を抑止）
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin main || true
+            git push origin main && break
+            echo "push failed. retry $i/3..."
+            sleep 3
+          done
