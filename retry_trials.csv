@@ -1,2 +1,3 @@
 ﻿"run_id","timestamp_jst","attempt","symbols","ok_count","fail_count","fail_reason","planned_sleep_sec"
 "20260120_165853_342127","2026-01-21 01:58:54","1","JPY=X BTC-USD GC=F ^TNX CL=F ^VIX","6","0","","0.0"
+"20260120_170121_364495","2026-01-21 02:01:22","1","JPY=X BTC-USD GC=F ^TNX CL=F ^VIX","6","0","","0.0"
