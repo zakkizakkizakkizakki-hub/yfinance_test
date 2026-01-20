@@ -1,20 +1,24 @@
 # save as: .github/workflows/market.yml
-name: market-yfinance
+name: market-collector
 
 on:
-  schedule:
-    - cron: "0 * * * *" # 1時間ごと
   workflow_dispatch:
+  schedule:
+    # JSTでの「毎時」を厳密にやるなら調整が必要ですが、
+    # ここはUTC基準で毎時0分に実行（GitHub Actionsの仕様）
+    - cron: "0 * * * *"
+
+permissions:
+  contents: write
 
 concurrency:
-  group: market-yfinance
+  group: market-collector
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -22,13 +26,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ✅ 先にpull（事故防止）
-      - name: Pull latest (before run)
+      # 事故防止：pullは必ず「実行前」に（unstaged changesを作る前に）
+      - name: Git pull (before run)
         run: |
-          set -euo pipefail
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git pull --rebase origin main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,33 +40,50 @@ jobs:
 
       - name: Install deps
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "pandas==2.2.3" "yfinance==0.2.54" "requests==2.32.5"
+          pip install pandas yfinance requests
 
-      - name: Run collector
+      - name: Collector (never fails)
         run: |
-          set -euo pipefail
           python market_yfinance_collector.py
 
-      # ✅ 欠損があればここで落ちる（監視維持）
-      - name: Run monitor (fail if missing)
+      # monitorのexit codeを保存（このステップ自体は止めない）
+      - name: Monitor (capture exit code)
+        id: monitor
+        continue-on-error: true
         run: |
-          set -euo pipefail
           python monitor.py
+          echo "code=0" >> $GITHUB_OUTPUT
 
-      # ✅ 失敗してもログは残す（原因追及のため）
-      - name: Commit & push logs
-        if: ${{ always() }}
+      - name: Set monitor exit code
+        if: always()
         run: |
-          set -euo pipefail
+          # continue-on-error のとき、この手で結果を取るのが確実
+          # （monitor.pyがexit 1でも次のstepに進める）
+          # 直前のstepが失敗した場合、ここに来た時点で $? は取れないため、
+          # monitor.py をもう一度実行してコードだけ取る（出力は捨てる）
+          python monitor.py >/dev/null 2>&1
+          echo "MONITOR_CODE=$?" >> $GITHUB_ENV
 
-          # 無い場合でも落ちない
-          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
-          test -f retry_trials.csv || touch retry_trials.csv
-          test -f yahoo_http_probe.jsonl || touch yahoo_http_probe.jsonl
+      # 失敗しても原因追及できるよう、必ずログをpushする
+      - name: Commit logs (always)
+        if: always()
+        run: |
+          git add market_yfinance_log.csv retry_trials.csv yahoo_http_probe.jsonl || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update market logs" || true
+            git push || true
+          fi
 
-          git add -A
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Update market logs"
-          git push origin main
+      # 最後に monitor の結果でジョブを成功/失敗にする（監視仕様）
+      - name: Fail job if monitor failed
+        if: always()
+        run: |
+          echo "MONITOR_CODE=$MONITOR_CODE"
+          if [ "${MONITOR_CODE:-0}" -ne 0 ]; then
+            echo "Monitor detected missing data -> failing job."
+            exit 1
+          fi
+          echo "Monitor OK."
