@@ -26,7 +26,7 @@ YAHOO_HTTP_PROBE_JSONL = "yahoo_http_probe.jsonl"
 
 CSV_ENCODING = "utf-8-sig"
 CSV_QUOTING = csv.QUOTE_ALL
-CSV_LINETERMINATOR = "\n"  # pandas は lineterminator
+CSV_LINETERMINATOR = "\n"
 
 ASSETS: Dict[str, str] = {
     "USDJPY": "JPY=X",
@@ -40,14 +40,9 @@ ASSETS: Dict[str, str] = {
 YF_PERIOD = "5d"
 YF_INTERVAL = "1d"
 
-# 目的(あなたの要件)
-# 1) 可能な限り落とさない（collectorは基本exit0）
-# 2) 早さ重視（無限待ちはしない）
-# 3) 失敗しても原因追跡できるログを残す
-
 MAX_RETRIES = 4
-BASE_SLEEP = 15.0          # 15, 30, 60, 120 (+ jitter)
-HTTP_TIMEOUT = 20          # Yahoo probe
+BASE_SLEEP = 15.0  # seconds (exponential backoff base)
+HTTP_TIMEOUT = 20
 
 # =========================
 # Time / IDs
@@ -62,7 +57,7 @@ def now_jst_str() -> str:
     return now_jst().strftime("%Y-%m-%d %H:%M:%S")
 
 def new_run_id() -> str:
-    # 例: 20260116_085259Z_123456
+    # Example: 20260116_085259Z_123456
     return now_utc().strftime("%Y%m%d_%H%M%SZ") + f"_{random.randint(100000, 999999)}"
 
 def _ts_suffix() -> str:
@@ -98,19 +93,19 @@ def _quarantine(path: str, reason: str) -> str:
 
 def _ensure_csv_header_or_quarantine(path: str) -> None:
     """
-    - 既存CSVが壊れている/列が違う場合は隔離して作り直す（仕様固定）
+    既存CSVが壊れている / 列が違う場合は隔離して作り直す（仕様固定）
     """
     if not os.path.exists(path):
         return
     if os.path.getsize(path) == 0:
         return
 
-    # QUOTE_ALL前提のヘッダ（厳格チェック）
-    expected_header = ",".join([f"\"{c}\"" for c in EXPECTED_COLS])
+    # QUOTE_ALL 前提のヘッダ文字列
+    expected = ",".join([f"\"{c}\"" for c in EXPECTED_COLS])
     first = _read_first_line(path)
 
-    if first != expected_header:
-        # QUOTE_ALLでない可能性への保険
+    if first != expected:
+        # QUOTE_ALLでない等の可能性があるので、CSVとしても一応解釈して確認
         try:
             dfh = pd.read_csv(path, encoding=CSV_ENCODING, nrows=1, engine="python")
             if list(dfh.columns) != EXPECTED_COLS:
@@ -119,18 +114,18 @@ def _ensure_csv_header_or_quarantine(path: str) -> None:
             _quarantine(path, f"read_fail:{type(e).__name__}")
         return
 
-    # 本文が壊れてる（ParserError等）なら隔離
+    # 本文が壊れていないか最小コストで確認
     try:
         pd.read_csv(path, encoding=CSV_ENCODING, engine="python")
     except Exception as e:
         _quarantine(path, f"parse_fail:{type(e).__name__}")
 
-# =========================
-# Logging helpers
-# =========================
 def _sleep_with_jitter(sec: float) -> None:
-    time.sleep(max(0.0, sec) + random.uniform(0.0, 2.0))
+    time.sleep(sec + random.uniform(0.0, 2.0))
 
+# =========================
+# retry_trials.csv (run_idで紐づけ)
+# =========================
 def _append_retry_trial(
     run_id: str,
     attempt: int,
@@ -162,6 +157,9 @@ def _append_retry_trial(
         lineterminator=CSV_LINETERMINATOR,
     )
 
+# =========================
+# yahoo_http_probe.jsonl (run_idで紐づけ)
+# =========================
 def _append_http_probe(
     run_id: str,
     phase: str,
@@ -182,7 +180,10 @@ def _append_http_probe(
         "attempt": int(attempt),
         "url": url,
         "params": params,
-        "request_headers": {"User-Agent": headers.get("User-Agent", ""), "Accept": headers.get("Accept", "")},
+        "request_headers": {
+            "User-Agent": headers.get("User-Agent", ""),
+            "Accept": headers.get("Accept", ""),
+        },
         "status_code": status_code,
         "content_type": resp_headers.get("Content-Type", ""),
         "content_length": resp_headers.get("Content-Length", ""),
@@ -196,6 +197,11 @@ def _append_http_probe(
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 def _probe_yahoo_quote_api(run_id: str, phase: str, attempt: int, tickers: List[str]) -> None:
+    """
+    Yahooのquote APIのHTTP応答（ステータス/ヘッダ）を「証拠」として残す。
+    注: これは yfinance 内部通信の完全コピーではないが、
+        “この実行環境からYahooへ投げた時に何が返るか” を事実として残せる。
+    """
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
     params = {"symbols": ",".join(tickers)}
     headers = {
@@ -233,6 +239,9 @@ def _probe_yahoo_quote_api(run_id: str, phase: str, attempt: int, tickers: List[
 # yfinance extraction
 # =========================
 def _yf_download_multi(tickers: List[str]) -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    まとめて1回のdownloadにする（リクエスト数を減らす）
+    """
     try:
         df = yf.download(
             tickers=tickers,
@@ -248,6 +257,9 @@ def _yf_download_multi(tickers: List[str]) -> Tuple[Optional[pd.DataFrame], str]
         return None, type(e).__name__
 
 def _extract_last_close(df: pd.DataFrame, ticker: str) -> Tuple[Optional[float], str]:
+    """
+    dfからtickerのCloseを抜く。取れなければ (None, reason)
+    """
     try:
         if df is None or df.empty:
             return None, "EmptyDF"
@@ -290,7 +302,6 @@ class AssetResult:
 # =========================
 def collect() -> int:
     run_id = new_run_id()
-
     print("=== yfinance market fetch ===")
     print(f"run_id       : {run_id}")
     print(f"timestamp_jst: {now_jst_str()}")
@@ -300,11 +311,10 @@ def collect() -> int:
 
     tickers = list(ASSETS.values())
     results: Dict[str, AssetResult] = {}
-
     last_err: str = ""
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # 証拠：毎回 pre_download を記録
+        # 毎回 “この環境→Yahoo” のHTTP応答を記録
         _probe_yahoo_quote_api(run_id, phase="pre_download", attempt=attempt, tickers=tickers)
 
         df, err = _yf_download_multi(tickers)
@@ -326,7 +336,7 @@ def collect() -> int:
             else:
                 date_str = ""
                 try:
-                    date_str = str(df.index[-1])[:10] if not df.empty else ""
+                    date_str = str(df.index[-1])[:10] if (df is not None and not df.empty) else ""
                 except Exception:
                     date_str = ""
                 results[name] = AssetResult(float(v), 0, "yfinance", date_str, "")
@@ -335,7 +345,7 @@ def collect() -> int:
         all_ok = (ok == len(ASSETS))
         sleep_sec = 0.0 if all_ok else (BASE_SLEEP * (2 ** (attempt - 1)))
 
-        # retry_trials は必ず残す（sleep_sec含む）
+        # retry_trials.csvに必ず記録（何秒待つ予定だったかも残す）
         _append_retry_trial(
             run_id=run_id,
             attempt=attempt,
@@ -350,11 +360,11 @@ def collect() -> int:
             break
 
         if attempt < MAX_RETRIES:
-            # 失敗直後の証拠も残す
+            # 失敗直後のHTTP応答も記録（同run_idで紐づく）
             _probe_yahoo_quote_api(run_id, phase="after_fail", attempt=attempt, tickers=tickers)
             _sleep_with_jitter(sleep_sec)
 
-    # 仕様固定で1行追記（列順強制）
+    # market_yfinance_log.csvへ 1行追記（列順固定）
     row: Dict[str, object] = {"run_id": run_id, "timestamp_jst": now_jst_str()}
     for a in ASSETS.keys():
         r = results.get(a, AssetResult(0.0, 1, "missing", "", "NoResult"))
@@ -376,7 +386,7 @@ def collect() -> int:
         lineterminator=CSV_LINETERMINATOR,
     )
 
-    # 目視ログ
+    # 目視用ログ
     for name, ticker in ASSETS.items():
         r = results[name]
         mark = "✅" if r.missing == 0 else "❌"
@@ -387,7 +397,7 @@ def collect() -> int:
     print(f"=== saved -> {RETRY_TRIALS_CSV} ===")
     print(f"=== saved -> {YAHOO_HTTP_PROBE_JSONL} ===")
 
-    # collector は落とさない（監視が落とす）
+    # collector自体は落とさない（監視が落とす設計）
     return 0
 
 if __name__ == "__main__":
