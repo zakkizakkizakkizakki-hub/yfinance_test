@@ -1,9 +1,10 @@
 name: market-yfinance
 
 on:
-  schedule:
-    - cron: "0 * * * *"  # 1時間ごと（必要なら調整）
   workflow_dispatch:
+  schedule:
+    # 例: 毎時 0分（必要に応じて変更）
+    - cron: "0 * * * *"
 
 concurrency:
   group: market-yfinance
@@ -21,15 +22,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ★ここが重要: 作業前にpull（あとでpullすると「unstaged changes」事故になりやすい）
-      - name: Pull latest (before run)
+      - name: Pull latest first (before generating files)
         run: |
           set -euo pipefail
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git pull --rebase origin main
+          git pull --rebase origin main || { echo "git pull --rebase failed"; git rebase --abort || true; exit 1; }
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -39,26 +37,40 @@ jobs:
           python -m pip install --upgrade pip
           pip install "pandas==2.2.3" "yfinance==0.2.54" "requests==2.32.5"
 
-      - name: Run collector
+      - name: Collector (never fail here)
         run: |
           set -euo pipefail
-          python market_yfinance_collector.py
+          python market_yfinance_collector.py || true
 
-      - name: Run monitor (fail if missing)
+      - name: Monitor (fail if missing)
         run: |
           set -euo pipefail
           python monitor.py
 
-      - name: Commit & push logs
+      - name: Upload artifacts (always)
         if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-run
+          path: |
+            market_yfinance_log.csv
+            retry_trials.csv
+            yahoo_http_probe.jsonl
+
+      - name: Commit & push logs
         run: |
           set -euo pipefail
-          # 無い場合でも落ちない
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          # 初回保険（無くても落ちないように）
           test -f market_yfinance_log.csv || touch market_yfinance_log.csv
           test -f retry_trials.csv || touch retry_trials.csv
           test -f yahoo_http_probe.jsonl || touch yahoo_http_probe.jsonl
 
           git add -A
+
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "Update market logs"
           git push origin main
