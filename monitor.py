@@ -1,73 +1,53 @@
 # save as: monitor.py
 from __future__ import annotations
 
-import os
 import sys
 import pandas as pd
 
-CSV_PATH = os.getenv("MARKET_CSV", "market_yfinance_log.csv")
-ENC = "utf-8-sig"
+CSV_PATH = "market_yfinance_log.csv"
+ENCODING = "utf-8-sig"
 
 ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
-def _safe_read_csv(path: str) -> pd.DataFrame:
-    # まず通常で試す → だめなら python engine + bad line skip
+def _safe_float(x) -> float:
     try:
-        return pd.read_csv(path, encoding=ENC)
+        return float(x)
     except Exception:
-        return pd.read_csv(path, encoding=ENC, engine="python", on_bad_lines="skip")
+        return float("nan")
 
 def main() -> int:
     print("\n" + "=" * 60)
     print("📡 Market Monitor")
     print("=" * 60)
 
-    if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
-        print(f"❌ CSVが存在しない or 空です: {CSV_PATH}")
-        return 1
-
-    try:
-        df = _safe_read_csv(CSV_PATH)
-    except Exception as e:
-        print(f"❌ CSVの読み取りに失敗しました: {type(e).__name__}: {e}")
-        return 1
-
+    df = pd.read_csv(CSV_PATH, encoding=ENCODING, engine="python")
     if df.empty:
-        print("❌ CSVは読み取れましたが、データ行がありません（空）")
+        print("❌ CSVが空です。")
         return 1
 
     last = df.iloc[-1].to_dict()
+    run_id = str(last.get("run_id", "Unknown"))
     ts = str(last.get("timestamp_jst", "Unknown"))
+
     print(f"[ Latest ] {ts}")
+    print(f"[ run_id ] {run_id}")
 
     missing_assets = []
+
     for a in ASSETS:
-        miss_key = f"{a}_missing"
-        fail_key = f"{a}_fail"
-        date_key = f"{a}_date"
+        v = _safe_float(last.get(a))
+        miss = int(_safe_float(last.get(f"{a}_missing")))
+        date = str(last.get(f"{a}_date", ""))
+        fail = str(last.get(f"{a}_fail", ""))
 
-        # 値は表示用（変な文字が来ても監視は missing フラグで判断）
-        val_raw = last.get(a, "")
-        try:
-            val = float(val_raw) if val_raw not in ("", None) else 0.0
-        except Exception:
-            val = 0.0
+        ok = (miss == 0) and (v == v) and (v > 0)
+        status = "✅正常" if ok else "⚠️欠損"
 
-        miss_raw = last.get(miss_key, 1)
-        try:
-            miss = int(miss_raw)
-        except Exception:
-            miss = 1
-
-        date = str(last.get(date_key, ""))
-        fail = str(last.get(fail_key, ""))
-
-        mark = "✅正常" if miss == 0 else "⚠️欠損"
-        print(f" - {a:<5}: {val:>12.6f} ({mark}) date={date if date else 'nan'}")
+        print(f" - {a:5s}: {v:12.6f} ({status}) date={date if date else 'n/a'}")
         if fail and fail != "nan":
             print(f"   Warning: {a}_fail: {fail}")
 
-        if miss != 0:
+        if not ok:
             missing_assets.append(a)
 
     if missing_assets:
@@ -81,4 +61,4 @@ def main() -> int:
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
