@@ -26,7 +26,7 @@ YAHOO_HTTP_PROBE_JSONL = "yahoo_http_probe.jsonl"
 
 CSV_ENCODING = "utf-8-sig"
 CSV_QUOTING = csv.QUOTE_ALL
-CSV_LINETERMINATOR = "\n"  # pandasは lineterminator
+CSV_LINETERMINATOR = "\n"  # pandas は lineterminator
 
 ASSETS: Dict[str, str] = {
     "USDJPY": "JPY=X",
@@ -40,9 +40,14 @@ ASSETS: Dict[str, str] = {
 YF_PERIOD = "5d"
 YF_INTERVAL = "1d"
 
+# 目的(あなたの要件)
+# 1) 可能な限り落とさない（collectorは基本exit0）
+# 2) 早さ重視（無限待ちはしない）
+# 3) 失敗しても原因追跡できるログを残す
+
 MAX_RETRIES = 4
-BASE_SLEEP = 15.0  # seconds (exponential backoff base)
-HTTP_TIMEOUT = 20
+BASE_SLEEP = 15.0          # 15, 30, 60, 120 (+ jitter)
+HTTP_TIMEOUT = 20          # Yahoo probe
 
 # =========================
 # Time / IDs
@@ -100,12 +105,12 @@ def _ensure_csv_header_or_quarantine(path: str) -> None:
     if os.path.getsize(path) == 0:
         return
 
-    # QUOTE_ALL前提のヘッダ文字列（厳格チェック）
+    # QUOTE_ALL前提のヘッダ（厳格チェック）
     expected_header = ",".join([f"\"{c}\"" for c in EXPECTED_COLS])
     first = _read_first_line(path)
 
     if first != expected_header:
-        # CSVとして読んで列名比較も試す（QUOTE_ALLでない可能性への保険）
+        # QUOTE_ALLでない可能性への保険
         try:
             dfh = pd.read_csv(path, encoding=CSV_ENCODING, nrows=1, engine="python")
             if list(dfh.columns) != EXPECTED_COLS:
@@ -114,7 +119,7 @@ def _ensure_csv_header_or_quarantine(path: str) -> None:
             _quarantine(path, f"read_fail:{type(e).__name__}")
         return
 
-    # 本文パースも確認（ParserError等なら隔離）
+    # 本文が壊れてる（ParserError等）なら隔離
     try:
         pd.read_csv(path, encoding=CSV_ENCODING, engine="python")
     except Exception as e:
@@ -124,7 +129,6 @@ def _ensure_csv_header_or_quarantine(path: str) -> None:
 # Logging helpers
 # =========================
 def _sleep_with_jitter(sec: float) -> None:
-    # 0〜2秒の揺らぎを足す（ログにはsecをそのまま残す）
     time.sleep(max(0.0, sec) + random.uniform(0.0, 2.0))
 
 def _append_retry_trial(
@@ -174,7 +178,7 @@ def _append_http_probe(
         "run_id": run_id,
         "ts_utc": now_utc().isoformat(),
         "timestamp_jst": now_jst_str(),
-        "phase": phase,          # e.g. "pre_download" / "after_fail"
+        "phase": phase,          # "pre_download" / "after_fail"
         "attempt": int(attempt),
         "url": url,
         "params": params,
@@ -185,16 +189,13 @@ def _append_http_probe(
         "cache_control": resp_headers.get("Cache-Control", ""),
         "server": resp_headers.get("Server", ""),
         "set_cookie": resp_headers.get("Set-Cookie", ""),
-        "body_head": body_head[:200],
+        "body_head": (body_head or "")[:200],
         "error": error,
     }
     with open(YAHOO_HTTP_PROBE_JSONL, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 def _probe_yahoo_quote_api(run_id: str, phase: str, attempt: int, tickers: List[str]) -> None:
-    """
-    Yahooのquote APIへのHTTP応答を「証拠」として残す。
-    """
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
     params = {"symbols": ",".join(tickers)}
     headers = {
@@ -232,9 +233,6 @@ def _probe_yahoo_quote_api(run_id: str, phase: str, attempt: int, tickers: List[
 # yfinance extraction
 # =========================
 def _yf_download_multi(tickers: List[str]) -> Tuple[Optional[pd.DataFrame], str]:
-    """
-    まとめて1回のdownloadにする（リクエスト数を減らす）。
-    """
     try:
         df = yf.download(
             tickers=tickers,
@@ -250,14 +248,10 @@ def _yf_download_multi(tickers: List[str]) -> Tuple[Optional[pd.DataFrame], str]
         return None, type(e).__name__
 
 def _extract_last_close(df: pd.DataFrame, ticker: str) -> Tuple[Optional[float], str]:
-    """
-    dfからtickerのCloseを抜く。取れなければ (None, reason)
-    """
     try:
         if df is None or df.empty:
             return None, "EmptyDF"
 
-        # MultiIndex のときが多い
         if isinstance(df.columns, pd.MultiIndex):
             if ("Close", ticker) in df.columns:
                 s = df[("Close", ticker)]
@@ -266,7 +260,6 @@ def _extract_last_close(df: pd.DataFrame, ticker: str) -> Tuple[Optional[float],
             else:
                 return None, "CloseNotFoundForTicker"
         else:
-            # 単一tickerの場合
             if "Close" in df.columns:
                 s = df["Close"]
             else:
@@ -306,17 +299,16 @@ def collect() -> int:
     _ensure_csv_header_or_quarantine(OUT_CSV)
 
     tickers = list(ASSETS.values())
-
     results: Dict[str, AssetResult] = {}
-    last_df: Optional[pd.DataFrame] = None
+
     last_err: str = ""
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # 毎回、証拠としてHTTP応答を記録（pre_download）
+        # 証拠：毎回 pre_download を記録
         _probe_yahoo_quote_api(run_id, phase="pre_download", attempt=attempt, tickers=tickers)
 
         df, err = _yf_download_multi(tickers)
-        last_df, last_err = df, err
+        last_err = err
 
         ok = 0
         fail = 0
@@ -334,17 +326,16 @@ def collect() -> int:
             else:
                 date_str = ""
                 try:
-                    date_str = str(df.index[-1])[:10] if (df is not None and not df.empty) else ""
+                    date_str = str(df.index[-1])[:10] if not df.empty else ""
                 except Exception:
                     date_str = ""
                 results[name] = AssetResult(float(v), 0, "yfinance", date_str, "")
                 ok += 1
 
-        # 次のsleepを計算（成功なら0）
         all_ok = (ok == len(ASSETS))
         sleep_sec = 0.0 if all_ok else (BASE_SLEEP * (2 ** (attempt - 1)))
 
-        # retry_trialsに必ず記録（sleep_sec含む）
+        # retry_trials は必ず残す（sleep_sec含む）
         _append_retry_trial(
             run_id=run_id,
             attempt=attempt,
@@ -359,11 +350,11 @@ def collect() -> int:
             break
 
         if attempt < MAX_RETRIES:
-            # 失敗した直後にもHTTP証拠を残す（after_fail）
+            # 失敗直後の証拠も残す
             _probe_yahoo_quote_api(run_id, phase="after_fail", attempt=attempt, tickers=tickers)
             _sleep_with_jitter(sleep_sec)
 
-    # 仕様固定で1行追記（列順はEXPECTED_COLSで強制）
+    # 仕様固定で1行追記（列順強制）
     row: Dict[str, object] = {"run_id": run_id, "timestamp_jst": now_jst_str()}
     for a in ASSETS.keys():
         r = results.get(a, AssetResult(0.0, 1, "missing", "", "NoResult"))
@@ -385,7 +376,7 @@ def collect() -> int:
         lineterminator=CSV_LINETERMINATOR,
     )
 
-    # 表示（目視用）
+    # 目視ログ
     for name, ticker in ASSETS.items():
         r = results[name]
         mark = "✅" if r.missing == 0 else "❌"
@@ -396,7 +387,7 @@ def collect() -> int:
     print(f"=== saved -> {RETRY_TRIALS_CSV} ===")
     print(f"=== saved -> {YAHOO_HTTP_PROBE_JSONL} ===")
 
-    # collector自体は落とさない（監視が落とす設計）
+    # collector は落とさない（監視が落とす）
     return 0
 
 if __name__ == "__main__":
