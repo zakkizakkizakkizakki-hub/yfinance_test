@@ -1,67 +1,73 @@
 # save as: monitor.py
 from __future__ import annotations
 
+import os
 import sys
 import pandas as pd
 
-CSV_PATH = "market_yfinance_log.csv"
-ENCODING = "utf-8-sig"
+CSV_PATH = os.getenv("MARKET_CSV", "market_yfinance_log.csv")
+ENC = "utf-8-sig"
 
 ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
-def _to_float(x):
+def _safe_read_csv(path: str) -> pd.DataFrame:
+    # まず通常で試す → だめなら python engine + bad line skip
     try:
-        return float(x)
+        return pd.read_csv(path, encoding=ENC)
     except Exception:
-        return float("nan")
-
-def _to_int(x, default=0) -> int:
-    try:
-        v = int(float(x))
-        return v
-    except Exception:
-        return default
+        return pd.read_csv(path, encoding=ENC, engine="python", on_bad_lines="skip")
 
 def main() -> int:
     print("\n" + "=" * 60)
     print("📡 Market Monitor")
     print("=" * 60)
 
+    if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
+        print(f"❌ CSVが存在しない or 空です: {CSV_PATH}")
+        return 1
+
     try:
-        df = pd.read_csv(CSV_PATH, encoding=ENCODING, engine="python")
+        df = _safe_read_csv(CSV_PATH)
     except Exception as e:
-        print(f"❌ CSVを読み取れません: {type(e).__name__}: {e}")
-        print("   → 監視仕様として異常扱い（exit 1）にします。")
+        print(f"❌ CSVの読み取りに失敗しました: {type(e).__name__}: {e}")
         return 1
 
     if df.empty:
-        print("❌ CSVが空です（監視不能） → exit 1")
+        print("❌ CSVは読み取れましたが、データ行がありません（空）")
         return 1
 
     last = df.iloc[-1].to_dict()
-    run_id = str(last.get("run_id", "Unknown"))
     ts = str(last.get("timestamp_jst", "Unknown"))
-
     print(f"[ Latest ] {ts}")
-    print(f"[ run_id ] {run_id}")
 
     missing_assets = []
-
     for a in ASSETS:
-        v = _to_float(last.get(a))
-        miss = _to_int(last.get(f"{a}_missing", 1), default=1)
-        date = str(last.get(f"{a}_date", ""))
-        fail = str(last.get(f"{a}_fail", ""))
+        miss_key = f"{a}_missing"
+        fail_key = f"{a}_fail"
+        date_key = f"{a}_date"
 
-        # 欠損判定（flag優先 + 値の安全チェック）
-        is_missing = (miss == 1) or not (v == v) or not (v > 0)
-        status = "✅正常" if not is_missing else "⚠️欠損"
+        # 値は表示用（変な文字が来ても監視は missing フラグで判断）
+        val_raw = last.get(a, "")
+        try:
+            val = float(val_raw) if val_raw not in ("", None) else 0.0
+        except Exception:
+            val = 0.0
 
-        print(f" - {a:5s}: {v:12.6f} ({status}) date={date if date and date != 'nan' else 'n/a'}")
+        miss_raw = last.get(miss_key, 1)
+        try:
+            miss = int(miss_raw)
+        except Exception:
+            miss = 1
+
+        date = str(last.get(date_key, ""))
+        fail = str(last.get(fail_key, ""))
+
+        mark = "✅正常" if miss == 0 else "⚠️欠損"
+        print(f" - {a:<5}: {val:>12.6f} ({mark}) date={date if date else 'nan'}")
         if fail and fail != "nan":
             print(f"   Warning: {a}_fail: {fail}")
 
-        if is_missing:
+        if miss != 0:
             missing_assets.append(a)
 
     if missing_assets:
@@ -71,8 +77,8 @@ def main() -> int:
         print("!" * 60)
         return 1
 
-    print("\n✅ OK: 欠損なし")
+    print("\n✅ 欠損なし（監視OK）")
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
