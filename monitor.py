@@ -9,21 +9,33 @@ ENCODING = "utf-8-sig"
 
 ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
-def _safe_float(x) -> float:
-    # 数字に変換できない場合は NaN 扱いにする（monitorが落ちないように）
+def _to_float(x):
     try:
         return float(x)
     except Exception:
         return float("nan")
+
+def _to_int(x, default=0) -> int:
+    try:
+        v = int(float(x))
+        return v
+    except Exception:
+        return default
 
 def main() -> int:
     print("\n" + "=" * 60)
     print("📡 Market Monitor")
     print("=" * 60)
 
-    df = pd.read_csv(CSV_PATH, encoding=ENCODING, engine="python")
+    try:
+        df = pd.read_csv(CSV_PATH, encoding=ENCODING, engine="python")
+    except Exception as e:
+        print(f"❌ CSVを読み取れません: {type(e).__name__}: {e}")
+        print("   → 監視仕様として異常扱い（exit 1）にします。")
+        return 1
+
     if df.empty:
-        print("❌ CSVが空です。")
+        print("❌ CSVが空です（監視不能） → exit 1")
         return 1
 
     last = df.iloc[-1].to_dict()
@@ -36,17 +48,20 @@ def main() -> int:
     missing_assets = []
 
     for a in ASSETS:
-        v = _safe_float(last.get(a))
-        miss = int(_safe_float(last.get(f"{a}_missing")))
+        v = _to_float(last.get(a))
+        miss = _to_int(last.get(f"{a}_missing", 1), default=1)
         date = str(last.get(f"{a}_date", ""))
         fail = str(last.get(f"{a}_fail", ""))
 
-        status = "✅正常" if miss == 0 and (v == v) and v > 0 else "⚠️欠損"
-        print(f" - {a:5s}: {v:12.6f} ({status}) date={date if date else 'n/a'}")
+        # 欠損判定（flag優先 + 値の安全チェック）
+        is_missing = (miss == 1) or not (v == v) or not (v > 0)
+        status = "✅正常" if not is_missing else "⚠️欠損"
+
+        print(f" - {a:5s}: {v:12.6f} ({status}) date={date if date and date != 'nan' else 'n/a'}")
         if fail and fail != "nan":
             print(f"   Warning: {a}_fail: {fail}")
 
-        if status == "⚠️欠損":
+        if is_missing:
             missing_assets.append(a)
 
     if missing_assets:
@@ -56,7 +71,7 @@ def main() -> int:
         print("!" * 60)
         return 1
 
-    print("\n✅ 欠損なし（監視OK）")
+    print("\n✅ OK: 欠損なし")
     return 0
 
 if __name__ == "__main__":
