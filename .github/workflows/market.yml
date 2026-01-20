@@ -1,24 +1,34 @@
 # save as: .github/workflows/market.yml
-name: market
+name: market-yfinance
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"  # 30分おき（必要なら変更）
+    - cron: "0 * * * *" # 1時間ごと
+  workflow_dispatch:
 
-permissions:
-  contents: write
+concurrency:
+  group: market-yfinance
+  cancel-in-progress: true
 
 jobs:
-  market:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+
+      # ✅ 先にpull（事故防止）
+      - name: Pull latest (before run)
+        run: |
+          set -euo pipefail
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git pull --rebase origin main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -27,49 +37,33 @@ jobs:
 
       - name: Install deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install pandas requests yfinance
+          pip install "pandas==2.2.3" "yfinance==0.2.54" "requests==2.32.5"
 
-      - name: Collector
-        env:
-          # リトライ設定（必要ならWorkflow側で調整）
-          MAX_RETRIES: "4"
-          BASE_SLEEP: "15"
-          JITTER_MAX: "2.0"
-          YF_PERIOD: "5d"
-          YF_INTERVAL: "1d"
+      - name: Run collector
         run: |
+          set -euo pipefail
           python market_yfinance_collector.py
 
-      - name: Monitor (fails if missing)
+      # ✅ 欠損があればここで落ちる（監視維持）
+      - name: Run monitor (fail if missing)
         run: |
+          set -euo pipefail
           python monitor.py
 
-      # 失敗しても証拠ファイルは必ず回収（原因追及のため）
-      - name: Upload artifacts (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: market-logs
-          path: |
-            market_yfinance_log.csv
-            retry_trials.csv
-            yahoo_http_probe.jsonl
-            market_yfinance_log.bad_*.csv
-          if-no-files-found: warn
-
-      # 任意：ログをリポジトリへ保存したい場合だけ有効化
-      - name: Commit logs back to repo (optional)
-        if: always() && env.PUSH_LOGS == 'true'
-        env:
-          PUSH_LOGS: "false"  # ← ここを true にしたい時だけ、Workflow上で上書きする運用推奨
+      # ✅ 失敗してもログは残す（原因追及のため）
+      - name: Commit & push logs
+        if: ${{ always() }}
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
+          set -euo pipefail
+
+          # 無い場合でも落ちない
+          test -f market_yfinance_log.csv || touch market_yfinance_log.csv
+          test -f retry_trials.csv || touch retry_trials.csv
+          test -f yahoo_http_probe.jsonl || touch yahoo_http_probe.jsonl
+
           git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Update market logs [skip ci]"
-            git push
-          fi
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update market logs"
+          git push origin main
