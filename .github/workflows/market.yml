@@ -1,14 +1,15 @@
-# save as: .github/workflows/market.yml
 name: market
 
 on:
   workflow_dispatch:
   schedule:
-    # 例：15分おき（必要に応じて変更）
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"  # 30分ごと（必要なら変更）
+
+permissions:
+  contents: write
 
 concurrency:
-  group: market-collector
+  group: market
   cancel-in-progress: true
 
 jobs:
@@ -20,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -29,29 +30,34 @@ jobs:
 
       - name: Install deps
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "pandas==2.2.3" "yfinance==0.2.54" "requests==2.32.5"
+          pip install pandas requests yfinance
 
-      # collectorは「落とさない」設計。必ず3ファイルを追記/生成する。
-      - name: Run collector
+      # 収集（失敗しても collector は exit 0。監視で落とす設計）
+      - name: Collect (yfinance)
         run: |
-          set -euo pipefail
           python market_yfinance_collector.py
 
-      # monitorは「欠損なら exit 1」＝監視を担当
-      - name: Run monitor (fail if missing)
+      # 監視（欠損なら exit 1）
+      - name: Monitor (exit 1 on missing)
         run: |
-          set -euo pipefail
           python monitor.py
 
-      # 失敗しても証拠（3ファイル）を必ず回収できるようにする
-      - name: Upload artifacts (always)
+      # 失敗してもログを残したいので always で commit/push
+      - name: Commit logs
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: market_logs
-          path: |
-            market_yfinance_log.csv
-            retry_trials.csv
-            yahoo_http_probe.jsonl
+        run: |
+          git status --porcelain
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add market_yfinance_log.csv retry_trials.csv yahoo_http_probe.jsonl || true
+
+          # 変更が無ければコミットしない
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "update market logs (actions)"
+          git push
