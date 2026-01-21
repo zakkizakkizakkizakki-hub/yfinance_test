@@ -1,22 +1,18 @@
 # save as: .github/workflows/market.yml
-name: market-collector
+name: market
 
 on:
   workflow_dispatch:
   schedule:
-    # JSTでの「毎時」を厳密にやるなら調整が必要ですが、
-    # ここはUTC基準で毎時0分に実行（GitHub Actionsの仕様）
-    - cron: "0 * * * *"
-
-permissions:
-  contents: write
+    # 例：15分おき（必要に応じて変更）
+    - cron: "*/15 * * * *"
 
 concurrency:
   group: market-collector
   cancel-in-progress: true
 
 jobs:
-  run:
+  market:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -24,14 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      # 事故防止：pullは必ず「実行前」に（unstaged changesを作る前に）
-      - name: Git pull (before run)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
+          fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -40,50 +29,29 @@ jobs:
 
       - name: Install deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests
+          pip install "pandas==2.2.3" "yfinance==0.2.54" "requests==2.32.5"
 
-      - name: Collector (never fails)
+      # collectorは「落とさない」設計。必ず3ファイルを追記/生成する。
+      - name: Run collector
         run: |
+          set -euo pipefail
           python market_yfinance_collector.py
 
-      # monitorのexit codeを保存（このステップ自体は止めない）
-      - name: Monitor (capture exit code)
-        id: monitor
-        continue-on-error: true
+      # monitorは「欠損なら exit 1」＝監視を担当
+      - name: Run monitor (fail if missing)
         run: |
+          set -euo pipefail
           python monitor.py
-          echo "code=0" >> $GITHUB_OUTPUT
 
-      - name: Set monitor exit code
+      # 失敗しても証拠（3ファイル）を必ず回収できるようにする
+      - name: Upload artifacts (always)
         if: always()
-        run: |
-          # continue-on-error のとき、この手で結果を取るのが確実
-          # （monitor.pyがexit 1でも次のstepに進める）
-          # 直前のstepが失敗した場合、ここに来た時点で $? は取れないため、
-          # monitor.py をもう一度実行してコードだけ取る（出力は捨てる）
-          python monitor.py >/dev/null 2>&1
-          echo "MONITOR_CODE=$?" >> $GITHUB_ENV
-
-      # 失敗しても原因追及できるよう、必ずログをpushする
-      - name: Commit logs (always)
-        if: always()
-        run: |
-          git add market_yfinance_log.csv retry_trials.csv yahoo_http_probe.jsonl || true
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Update market logs" || true
-            git push || true
-          fi
-
-      # 最後に monitor の結果でジョブを成功/失敗にする（監視仕様）
-      - name: Fail job if monitor failed
-        if: always()
-        run: |
-          echo "MONITOR_CODE=$MONITOR_CODE"
-          if [ "${MONITOR_CODE:-0}" -ne 0 ]; then
-            echo "Monitor detected missing data -> failing job."
-            exit 1
-          fi
-          echo "Monitor OK."
+        uses: actions/upload-artifact@v4
+        with:
+          name: market_logs
+          path: |
+            market_yfinance_log.csv
+            retry_trials.csv
+            yahoo_http_probe.jsonl
