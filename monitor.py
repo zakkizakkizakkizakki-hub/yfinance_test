@@ -1,55 +1,39 @@
 # save as: monitor.py
 from __future__ import annotations
 
-import math
 import os
-from typing import List, Tuple
+import sys
+from datetime import datetime
 
 import pandas as pd
 
 CSV_PATH = "market_yfinance_log.csv"
-ENCODING = "utf-8-sig"
+ENC = "utf-8-sig"
 
-ASSET_NAMES = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
+ASSETS = ["USDJPY", "BTC", "Gold", "US10Y", "Oil", "VIX"]
 
-def _to_float(x) -> float:
-    """
-    数字に変換できない（例: 'EmptyDF'）場合は NaN にする
-    """
+def _to_float(x) -> float | None:
     try:
-        if x is None:
-            return float("nan")
-        if isinstance(x, str) and x.strip() == "":
-            return float("nan")
+        if pd.isna(x):
+            return None
+        # 文字列 "EmptyDF" 等は float 変換で落ちるのでここで弾く
         return float(x)
     except Exception:
-        return float("nan")
-
-def _is_missing(value: float, missing_flag) -> bool:
-    if missing_flag is None:
-        return True
-    try:
-        m = int(missing_flag)
-    except Exception:
-        m = 1
-    if m == 1:
-        return True
-    if not (value > 0) or math.isnan(value):
-        return True
-    return False
+        return None
 
 def main() -> int:
-    print("\n============================================================")
+    print("\n" + "=" * 60)
     print("📡 Market Monitor")
-    print("============================================================")
+    print("=" * 60)
 
     if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
-        print(f"❌ {CSV_PATH} が存在しない/空です。")
+        print(f"❌ {CSV_PATH} が存在しない/空です（collectorが生成できていません）")
         return 1
 
-    df = pd.read_csv(CSV_PATH, encoding=ENCODING)
+    # 以前の列ズレ事故を想定して on_bad_lines="skip"
+    df = pd.read_csv(CSV_PATH, encoding=ENC, on_bad_lines="skip")
     if df.empty:
-        print(f"❌ {CSV_PATH} が空です。")
+        print(f"❌ {CSV_PATH} が読み込めましたが中身が空です（破損または全行スキップ）")
         return 1
 
     last = df.iloc[-1].to_dict()
@@ -61,34 +45,44 @@ def main() -> int:
     if run_id:
         print(f"[ run_id ] {run_id}")
 
-    missing_assets: List[str] = []
+    missing_assets = []
 
-    for a in ASSET_NAMES:
-        v = _to_float(last.get(a))
-        miss_flag = last.get(f"{a}_missing")
-        src = str(last.get(f"{a}_source", ""))
+    for a in ASSETS:
+        v_raw = last.get(a, None)
+        m_raw = last.get(f"{a}_missing", None)
         date = str(last.get(f"{a}_date", ""))
         fail = str(last.get(f"{a}_fail", ""))
 
-        miss = _is_missing(v, miss_flag)
+        v = _to_float(v_raw)
+        m = _to_float(m_raw)
 
-        mark = "✅正常" if not miss else "⚠️欠損"
-        v_disp = "nan" if math.isnan(v) else f"{v:.6f}"
-        print(f" - {a:5s}: {v_disp:>12s} ({mark}) src={src} date={date}")
-        if fail:
-            print(f"   Warning: {a}_fail: {fail}")
+        is_missing = False
+        if m is None:
+            is_missing = True
+        else:
+            is_missing = (int(m) == 1)
 
-        if miss:
+        # 値が数値でない/0以下も欠損扱い（監視として安全側）
+        if v is None or not (v > 0):
+            is_missing = True
+
+        mark = "✅正常" if not is_missing else "⚠️欠損"
+        v_disp = "nan" if v is None else f"{v:.6f}"
+        print(f" - {a:<5}: {v_disp:>12} ({mark}) date={date or 'nan'}")
+        if is_missing:
+            print(f"   Warning: {a}_fail: {fail or 'Unknown'}")
+
+        if is_missing:
             missing_assets.append(a)
 
     if missing_assets:
-        print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("\n" + "!" * 60)
         print(f"❌ 欠損を検知: {', '.join(missing_assets)}")
         print("   → 監視仕様により exit code 1 で終了します。")
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!" * 60)
         return 1
 
-    print("\n✅ 全資産取得OK（欠損なし）")
+    print("\n✅ 欠損なし。monitorは正常終了します。")
     return 0
 
 if __name__ == "__main__":
