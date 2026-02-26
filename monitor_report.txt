@@ -2,11 +2,11 @@
 ============================================================
 📡 Market Monitor
 ============================================================
-[ Latest ] 2026-02-26 23:31:24
-[ run_id ] 20260226_143121Z_250882
- - USDJPY:   156.072006 (✅正常) date=2026-02-26 src=yfinance
- - BTC  : 68109.171875 (✅正常) date=2026-02-26 src=yfinance
- - Gold :  5179.600098 (✅正常) date=2026-02-26 src=yfinance
- - US10Y:     4.040000 (✅正常) date=2026-02-26 src=yfinance
- - Oil  :    64.190002 (✅正常) date=2026-02-26 src=yfinance
- - VIX  :    17.580000 (✅正常) date=2026-02-26 src=yfinance
+[ Latest ] 2026-02-27 00:37:40
+[ run_id ] 20260226_153739Z_894655
+ - USDJPY:   156.078003 (✅正常) date=2026-02-26 src=yfinance
+ - BTC  : 66810.843750 (✅正常) date=2026-02-26 src=yfinance
+ - Gold :  5156.200195 (✅正常) date=2026-02-26 src=yfinance
+ - US10Y:     4.014000 (✅正常) date=2026-02-26 src=yfinance
+ - Oil  :    65.510002 (✅正常) date=2026-02-26 src=yfinance
+ - VIX  :    20.469999 (✅正常) date=2026-02-26 src=yfinance
